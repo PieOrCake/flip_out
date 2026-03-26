@@ -110,7 +110,7 @@ void ProcessKeybind(const char* aIdentifier, bool aIsRelease);
 void AddonRender();
 void AddonOptions();
 
-static const char* SEED_URL = "https://raw.githubusercontent.com/PieOrCake/flip_out_data/main/seed_prices.json";
+static const char* SEED_URL = "https://raw.githubusercontent.com/PieOrCake/flip_out/main/data/seed_prices.json";
 
 static void LoadConfig() {
     std::string path = FlipOut::PriceDB::GetDataDirectory() + "/config.json";

@@ -2,6 +2,12 @@
 
 A Guild Wars 2 addon for the [Nexus](https://raidcore.gg/Nexus) framework that tracks Trading Post market trends and helps you find profitable flips.
 
+## AI Notice
+
+This addon has been 100% created in [Windsurf](https://windsurf.com/) using Claude. I understand that some folks have a moral, financial or political objection to creating software using an LLM. I just wanted to make a useful tool for the GW2 community, and this was the only way I could do it.
+
+If an LLM creating software upsets you, then perhaps this repo isn't for you. Move on, and enjoy your day.
+
 ## Features
 
 - **Flip Scanner** — Scans all tradeable items and ranks them by profit, margin, ROI, or volume
@@ -79,6 +85,9 @@ Profit = Sell Price - (5% of Sell) - (10% of Sell) - Buy Price
 | `IconManager.h/cpp` | Async icon downloading and texture loading |
 | `HttpClient.h/cpp` | WinINet HTTP client wrapper |
 
+## License
+
+MIT
 ## Compatibility
 
 - **Nexus API**: v6
@@ -86,6 +95,3 @@ Profit = Sell Price - (5% of Sell) - (10% of Sell) - Buy Price
 - **nlohmann/json**: v3.11.3
 - Matched to [Hoard & Seek](https://github.com/PieOrCake/hoard_and_seek) for compatibility
 
-## License
-
-MIT
