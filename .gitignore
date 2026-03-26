@@ -1,0 +1,11 @@
+build/
+lib/imgui/
+lib/nlohmann/
+*.dll
+*.lib
+*.o
+*.d
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+Makefile
