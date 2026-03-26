@@ -7,7 +7,6 @@
 #include <thread>
 #include <chrono>
 #include <cfloat>
-#include <fstream>
 
 #include "nexus/Nexus.h"
 #include "imgui.h"
@@ -103,9 +102,7 @@ static bool g_AutoRefresh = true;
 static int g_RefreshIntervalMin = 15;
 static std::chrono::steady_clock::time_point g_LastAutoRefresh;
 
-// Seed data config (upload_enabled = true only on maintainer's machine)
-static bool g_UploadEnabled = false;
-static std::string g_SeedExportPath; // set from config
+// Seed data
 static bool g_SeedDownloaded = false;
 
 // DLL entry point
@@ -127,31 +124,6 @@ void AddonRender();
 void AddonOptions();
 
 static const char* SEED_URL = "https://raw.githubusercontent.com/PieOrCake/flip_out/main/data/seed_prices.json";
-
-static void LoadConfig() {
-    std::string path = FlipOut::PriceDB::GetDataDirectory() + "/config.json";
-    std::ifstream file(path);
-    if (!file.is_open()) return;
-    try {
-        nlohmann::json j;
-        file >> j;
-        g_UploadEnabled = j.value("upload_enabled", false);
-        g_SeedExportPath = j.value("seed_export_path", "");
-    } catch (...) {}
-}
-
-static void SaveConfig() {
-    FlipOut::TPAPI::EnsureDataDirectory();
-    std::string path = FlipOut::PriceDB::GetDataDirectory() + "/config.json";
-    try {
-        nlohmann::json j = {
-            {"upload_enabled", g_UploadEnabled},
-            {"seed_export_path", g_SeedExportPath}
-        };
-        std::ofstream file(path);
-        if (file.is_open()) file << j.dump(2);
-    } catch (...) {}
-}
 
 static void TryDownloadSeed() {
     if (g_SeedDownloaded) return;
@@ -586,12 +558,7 @@ static void RenderFlipsTab() {
             FlipOut::PriceDB::RecordBulkPrices(snaps);
             FlipOut::PriceDB::Save();
 
-            // Export seed data if upload is enabled (maintainer only)
-            if (g_UploadEnabled && !g_SeedExportPath.empty()) {
-                FlipOut::PriceDB::ExportSeed(g_SeedExportPath, 30);
-            }
-
-            // Query H&S for owned status of top flip candidates and market movers
+            // Query Hoard & Seek for owned status of top flip candidates and market movers
             if (FlipOut::HoardBridge::IsDataAvailable()) {
                 // Collect unique item IDs to query
                 std::vector<uint32_t> queryIds;
@@ -662,8 +629,36 @@ static void RenderFlipsTab() {
                     ImGui::TableNextRow(0, ICON_SIZE + 4);
                     ImGui::PushID((int)opp.item_id);
 
-                    // Item name + icon
+                    // Invisible selectable spanning all columns for row right-click
                     ImGui::TableNextColumn();
+                    ImGui::Selectable("##row", false,
+                        ImGuiSelectableFlags_SpanAllColumns | ImGuiSelectableFlags_AllowItemOverlap,
+                        ImVec2(0, ICON_SIZE));
+                    if (ImGui::BeginPopupContextItem("##sell_ctx")) {
+                        bool watched = FlipOut::PriceDB::IsOnWatchlist(opp.item_id);
+                        if (watched) {
+                            if (ImGui::MenuItem("Remove from Watchlist")) {
+                                FlipOut::PriceDB::RemoveFromWatchlist(opp.item_id);
+                                FlipOut::PriceDB::SaveWatchlist();
+                            }
+                        } else {
+                            if (ImGui::MenuItem("Add to Watchlist")) {
+                                FlipOut::PriceDB::AddToWatchlist(opp.item_id);
+                                FlipOut::PriceDB::SaveWatchlist();
+                            }
+                        }
+                        if (ImGui::MenuItem("Search in Hoard & Seek")) {
+                            FlipOut::HoardBridge::SearchInHoard(opp.name);
+                        }
+                        ImGui::Separator();
+                        if (ImGui::MenuItem("View Price History")) {
+                            OpenPriceHistory(opp.item_id, opp.name, opp.rarity);
+                        }
+                        ImGui::EndPopup();
+                    }
+                    ImGui::SameLine(0, 0);
+
+                    // Item name + icon
                     const auto* info = FlipOut::TPAPI::GetItemInfo(opp.item_id);
                     std::string iconUrl = info ? info->icon_url : "";
                     RenderItemIcon(opp.item_id, iconUrl, opp.rarity);
@@ -760,7 +755,7 @@ static void RenderFlipsTab() {
                                 FlipOut::PriceDB::SaveWatchlist();
                             }
                         }
-                        if (ImGui::MenuItem("Search in H&S")) {
+                        if (ImGui::MenuItem("Search in Hoard & Seek")) {
                             FlipOut::HoardBridge::SearchInHoard(m.name);
                         }
                         ImGui::Separator();
@@ -878,7 +873,7 @@ static void RenderFlipsTab() {
                         FlipOut::PriceDB::SaveWatchlist();
                     }
                 }
-                if (ImGui::MenuItem("Search in H&S")) {
+                if (ImGui::MenuItem("Search in Hoard & Seek")) {
                     FlipOut::HoardBridge::SearchInHoard(flip.name);
                 }
                 ImGui::Separator();
@@ -1102,7 +1097,7 @@ static void RenderWatchlistTab() {
 static void RenderTransactionsTab() {
     if (!FlipOut::HoardBridge::IsDataAvailable()) {
         ImGui::TextColored(ImVec4(1.0f, 0.6f, 0.2f, 1.0f),
-            "Hoard & Seek not connected. Transactions require H&S for API access.");
+            "Hoard & Seek not connected. Transactions require Hoard & Seek for API access.");
         if (ImGui::Button("Retry Connection")) {
             FlipOut::HoardBridge::Ping();
         }
@@ -1114,7 +1109,7 @@ static void RenderTransactionsTab() {
 
     if (!txLoaded && !txLoading) {
         ImGui::TextColored(ImVec4(0.6f, 0.6f, 0.6f, 1.0f),
-            "Click 'Load Transactions' to view your pending TP orders (via H&S).");
+            "Click 'Load Transactions' to view your pending TP orders (via Hoard & Seek).");
     }
 
     if (txLoading) ImGui::PushStyleVar(ImGuiStyleVar_Alpha, 0.5f);
@@ -1125,7 +1120,7 @@ static void RenderTransactionsTab() {
 
     if (txLoading) {
         ImGui::SameLine();
-        ImGui::TextColored(ImVec4(1.0f, 0.85f, 0.0f, 1.0f), "Loading via H&S...");
+        ImGui::TextColored(ImVec4(1.0f, 0.85f, 0.0f, 1.0f), "Loading via Hoard & Seek...");
     }
 
     if (!txLoaded) return;
@@ -1214,7 +1209,7 @@ static void RenderTransactionsTab() {
     }
 }
 
-// --- Search Tab (TP item search, with owned count from H&S) ---
+// --- Search Tab (TP item search, with owned count from Hoard & Seek) ---
 
 static void RenderSearchTab() {
     ImGui::PushItemWidth(-80);
@@ -1227,7 +1222,7 @@ static void RenderSearchTab() {
         std::string query(g_SearchBuf);
         if (query.length() >= 3) {
             g_SearchResults = FlipOut::TPAPI::SearchItems(query, 100);
-            // Query owned counts from H&S for search results
+            // Query owned counts from Hoard & Seek for search results
             if (FlipOut::HoardBridge::IsDataAvailable()) {
                 std::vector<uint32_t> ids;
                 for (const auto& item : g_SearchResults) ids.push_back(item.id);
@@ -1290,7 +1285,7 @@ static void RenderSearchTab() {
                         FlipOut::PriceDB::SaveWatchlist();
                     }
                 }
-                if (ImGui::MenuItem("Search in H&S")) {
+                if (ImGui::MenuItem("Search in Hoard & Seek")) {
                     FlipOut::HoardBridge::SearchInHoard(item.name);
                 }
                 ImGui::Separator();
@@ -1331,7 +1326,7 @@ static void RenderSearchTab() {
                 ImGui::Text("---");
             }
 
-            // Owned count from H&S
+            // Owned count from Hoard & Seek
             if (hsConnected) {
                 ImGui::TableNextColumn();
                 const auto* owned = FlipOut::HoardBridge::GetOwnedItem(item.id);
@@ -1372,7 +1367,6 @@ void AddonLoad(AddonAPI_t* aApi) {
     FlipOut::TPAPI::LoadItemCache();
     FlipOut::PriceDB::Load();
     FlipOut::PriceDB::LoadWatchlist();
-    LoadConfig();
 
     // Download community seed data if local history is thin
     TryDownloadSeed();
@@ -1465,7 +1459,7 @@ void AddonRender() {
 
     if (!g_WindowVisible) return;
 
-    // On first window open, request H&S permissions
+    // On first window open, request Hoard & Seek permissions
     {
         static bool s_FirstOpenDone = false;
         if (!s_FirstOpenDone) {
@@ -1482,15 +1476,15 @@ void AddonRender() {
         return;
     }
 
-    // H&S connection status bar
+    // Hoard & Seek connection status bar
     {
         auto hsStatus = FlipOut::HoardBridge::GetStatus();
         if (hsStatus == FlipOut::HoardStatus::Connected) {
-            ImGui::TextColored(ImVec4(0.35f, 0.82f, 0.35f, 1.0f), "[H&S: Connected]");
+            ImGui::TextColored(ImVec4(0.35f, 0.82f, 0.35f, 1.0f), "[Hoard & Seek: Connected]");
         } else if (hsStatus == FlipOut::HoardStatus::NoData) {
-            ImGui::TextColored(ImVec4(1.0f, 0.85f, 0.0f, 1.0f), "[H&S: No Data]");
+            ImGui::TextColored(ImVec4(1.0f, 0.85f, 0.0f, 1.0f), "[Hoard & Seek: No Data]");
         } else {
-            ImGui::TextColored(ImVec4(1.0f, 0.4f, 0.2f, 1.0f), "[H&S: Not Connected]");
+            ImGui::TextColored(ImVec4(1.0f, 0.4f, 0.2f, 1.0f), "[Hoard & Seek: Not Connected]");
             ImGui::SameLine();
             if (ImGui::SmallButton("Reconnect")) {
                 FlipOut::HoardBridge::Ping();
@@ -1562,13 +1556,13 @@ void AddonOptions() {
             break;
     }
     if (FlipOut::HoardBridge::IsPermissionDenied()) {
-        ImGui::TextColored(ImVec4(1.0f, 0.3f, 0.3f, 1.0f), "Permission denied by user in H&S");
+        ImGui::TextColored(ImVec4(1.0f, 0.3f, 0.3f, 1.0f), "Permission denied by user in Hoard & Seek");
     } else if (FlipOut::HoardBridge::IsPermissionPending()) {
-        ImGui::TextColored(ImVec4(1.0f, 0.85f, 0.0f, 1.0f), "Permission pending (check H&S)");
+        ImGui::TextColored(ImVec4(1.0f, 0.85f, 0.0f, 1.0f), "Permission pending (check Hoard & Seek)");
     }
 
     if (hsStatus != FlipOut::HoardStatus::Connected) {
-        if (ImGui::Button("Ping H&S")) {
+        if (ImGui::Button("Ping Hoard & Seek")) {
             FlipOut::HoardBridge::Ping();
         }
         ImGui::SameLine();
@@ -1586,7 +1580,7 @@ void AddonOptions() {
     ImGui::Checkbox("Enable auto-refresh for watchlist", &g_AutoRefresh);
     ImGui::SliderInt("Refresh interval (minutes)", &g_RefreshIntervalMin, 5, 60);
     ImGui::TextColored(ImVec4(0.6f, 0.6f, 0.6f, 1.0f),
-        "TP prices are public (no API key needed). Transactions use H&S.");
+        "TP prices are public (no API key needed). Transactions use Hoard & Seek.");
 
     ImGui::Spacing();
     ImGui::Separator();
