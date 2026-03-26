@@ -61,6 +61,10 @@ namespace FlipOut {
         static bool LoadWatchlist();
         static bool SaveWatchlist();
 
+        // Seed data (community price history)
+        static bool ExportSeed(const std::string& path, int max_entries_per_item = 30);
+        static bool ImportSeed(const std::string& json_data);
+
         // Data directory (delegates to TPAPI)
         static std::string GetDataDirectory();
 

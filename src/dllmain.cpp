@@ -7,6 +7,7 @@
 #include <thread>
 #include <chrono>
 #include <cfloat>
+#include <fstream>
 
 #include "nexus/Nexus.h"
 #include "imgui.h"
@@ -15,6 +16,7 @@
 #include "Analyzer.h"
 #include "IconManager.h"
 #include "HoardBridge.h"
+#include "HttpClient.h"
 #include <nlohmann/json.hpp>
 
 // Version constants
@@ -85,6 +87,11 @@ static bool g_AutoRefresh = true;
 static int g_RefreshIntervalMin = 15;
 static std::chrono::steady_clock::time_point g_LastAutoRefresh;
 
+// Seed data config (upload_enabled = true only on maintainer's machine)
+static bool g_UploadEnabled = false;
+static std::string g_SeedExportPath; // set from config
+static bool g_SeedDownloaded = false;
+
 // DLL entry point
 BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserved) {
     switch (ul_reason_for_call) {
@@ -102,6 +109,52 @@ void AddonUnload();
 void ProcessKeybind(const char* aIdentifier, bool aIsRelease);
 void AddonRender();
 void AddonOptions();
+
+static const char* SEED_URL = "https://raw.githubusercontent.com/PieOrCake/flip_out_data/main/seed_prices.json";
+
+static void LoadConfig() {
+    std::string path = FlipOut::PriceDB::GetDataDirectory() + "/config.json";
+    std::ifstream file(path);
+    if (!file.is_open()) return;
+    try {
+        nlohmann::json j;
+        file >> j;
+        g_UploadEnabled = j.value("upload_enabled", false);
+        g_SeedExportPath = j.value("seed_export_path", "");
+    } catch (...) {}
+}
+
+static void SaveConfig() {
+    FlipOut::TPAPI::EnsureDataDirectory();
+    std::string path = FlipOut::PriceDB::GetDataDirectory() + "/config.json";
+    try {
+        nlohmann::json j = {
+            {"upload_enabled", g_UploadEnabled},
+            {"seed_export_path", g_SeedExportPath}
+        };
+        std::ofstream file(path);
+        if (file.is_open()) file << j.dump(2);
+    } catch (...) {}
+}
+
+static void TryDownloadSeed() {
+    if (g_SeedDownloaded) return;
+    if (FlipOut::PriceDB::GetTrackedItemCount() >= 100) return;
+    g_SeedDownloaded = true;
+
+    std::thread([]() {
+        try {
+            std::string data = FlipOut::HttpClient::Get(SEED_URL);
+            if (data.empty() || data[0] != '{') return;
+            if (FlipOut::PriceDB::ImportSeed(data)) {
+                FlipOut::PriceDB::Save();
+                if (APIDefs) {
+                    APIDefs->Log(LOGL_INFO, "FlipOut", "Imported community seed price data");
+                }
+            }
+        } catch (...) {}
+    }).detach();
+}
 
 // --- Render Helpers ---
 
@@ -516,6 +569,11 @@ static void RenderFlipsTab() {
             }
             FlipOut::PriceDB::RecordBulkPrices(snaps);
             FlipOut::PriceDB::Save();
+
+            // Export seed data if upload is enabled (maintainer only)
+            if (g_UploadEnabled && !g_SeedExportPath.empty()) {
+                FlipOut::PriceDB::ExportSeed(g_SeedExportPath, 30);
+            }
 
             // Query H&S for owned status of top flip candidates and market movers
             if (FlipOut::HoardBridge::IsDataAvailable()) {
@@ -1298,6 +1356,10 @@ void AddonLoad(AddonAPI_t* aApi) {
     FlipOut::TPAPI::LoadItemCache();
     FlipOut::PriceDB::Load();
     FlipOut::PriceDB::LoadWatchlist();
+    LoadConfig();
+
+    // Download community seed data if local history is thin
+    TryDownloadSeed();
 
     // Start scanning immediately so results are ready by the time the user logs in
     FlipOut::TPAPI::FetchAllPricesAsync();

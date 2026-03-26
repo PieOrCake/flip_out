@@ -264,4 +264,87 @@ namespace FlipOut {
         }
     }
 
+    // --- Seed Data ---
+
+    bool PriceDB::ExportSeed(const std::string& path, int max_entries_per_item) {
+        try {
+            json j = json::object();
+            {
+                std::lock_guard<std::mutex> lock(s_mutex);
+                for (const auto& [id, history] : s_history) {
+                    if (history.empty()) continue;
+                    json arr = json::array();
+                    int start = (int)history.size() > max_entries_per_item
+                        ? (int)history.size() - max_entries_per_item : 0;
+                    for (int i = start; i < (int)history.size(); i++) {
+                        const auto& snap = history[i];
+                        arr.push_back({
+                            {"t", (int64_t)snap.timestamp},
+                            {"b", snap.buy_price},
+                            {"s", snap.sell_price},
+                            {"bq", snap.buy_quantity},
+                            {"sq", snap.sell_quantity}
+                        });
+                    }
+                    j[std::to_string(id)] = arr;
+                }
+            }
+            std::ofstream file(path);
+            if (!file.is_open()) return false;
+            file << j.dump();
+            file.flush();
+            return true;
+        } catch (...) {
+            return false;
+        }
+    }
+
+    bool PriceDB::ImportSeed(const std::string& json_data) {
+        try {
+            json j = json::parse(json_data);
+            if (!j.is_object()) return false;
+
+            std::lock_guard<std::mutex> lock(s_mutex);
+            int imported = 0;
+            for (auto& [key, arr] : j.items()) {
+                uint32_t id = std::stoul(key);
+                if (!arr.is_array()) continue;
+
+                auto& local = s_history[id];
+                time_t earliest_local = 0;
+                if (!local.empty()) {
+                    earliest_local = local.front().timestamp;
+                }
+
+                std::vector<PriceSnapshot> new_entries;
+                for (const auto& entry : arr) {
+                    PriceSnapshot snap;
+                    snap.timestamp = (time_t)entry.value("t", (int64_t)0);
+                    snap.buy_price = entry.value("b", 0);
+                    snap.sell_price = entry.value("s", 0);
+                    snap.buy_quantity = entry.value("bq", 0);
+                    snap.sell_quantity = entry.value("sq", 0);
+
+                    // Only import entries older than our earliest local data
+                    if (local.empty() || snap.timestamp < earliest_local) {
+                        new_entries.push_back(snap);
+                    }
+                }
+
+                if (!new_entries.empty()) {
+                    std::sort(new_entries.begin(), new_entries.end(),
+                        [](const PriceSnapshot& a, const PriceSnapshot& b) {
+                            return a.timestamp < b.timestamp;
+                        });
+                    new_entries.insert(new_entries.end(), local.begin(), local.end());
+                    local = std::move(new_entries);
+                    imported++;
+                }
+            }
+            return imported > 0;
+        } catch (...) {
+            return false;
+        }
+    }
+
 }
