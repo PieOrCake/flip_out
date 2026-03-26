@@ -136,6 +136,21 @@ def draw_icon(bright=False):
         put(int(round(mx)), int(round(my)), motion_col)
         put(int(round(mx)) + 1, int(round(my)), motion_col)
 
+    # Add black border: for every non-transparent pixel, fill surrounding
+    # transparent pixels with black
+    border_col = (0, 0, 0, 255)
+    border_pixels = []
+    for y in range(H):
+        for x in range(W):
+            if pixels[y][x][3] > 0:
+                for dy in range(-1, 2):
+                    for dx in range(-1, 2):
+                        nx, ny = x + dx, y + dy
+                        if 0 <= nx < W and 0 <= ny < H and pixels[ny][nx][3] == 0:
+                            border_pixels.append((nx, ny))
+    for bx, by in border_pixels:
+        pixels[by][bx] = border_col
+
     return pixels
 
 def pixels_to_c_array(png_data, name):
