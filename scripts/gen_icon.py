@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """Generate 32x32 quick access icons for Flip Out.
-Draws an upside-down stick figure who just jumped off a trampoline."""
+Draws an upside-down stick figure tilted at 30 degrees."""
 
 import struct
 import zlib
 import os
+import math
 
 def make_png(pixels, width, height):
     """Create a minimal RGBA PNG from pixel data."""
@@ -24,44 +25,47 @@ def make_png(pixels, width, height):
             chunk(b'IEND', b''))
 
 def draw_icon(bright=False):
-    """Draw a 32x32 upside-down stick figure above a trampoline."""
+    """Draw a 32x32 upside-down stick figure tilted 30 degrees."""
     W, H = 32, 32
-    # transparent background
     pixels = [[(0, 0, 0, 0) for _ in range(W)] for _ in range(H)]
 
+    # Grey/off-white matching Nexus quick access bar icons
     if bright:
-        body_col = (255, 220, 100, 255)   # bright gold
-        head_col = (255, 230, 130, 255)    # bright gold head
-        tramp_col = (120, 200, 255, 255)   # bright blue trampoline
-        leg_col = (200, 220, 100, 255)     # bright legs
+        body_col = (235, 235, 235, 255)    # bright white-grey
+        head_col = (240, 240, 240, 255)    # slightly brighter head
+        motion_col = (200, 200, 200, 140)  # motion lines
     else:
-        body_col = (220, 180, 60, 255)     # gold
-        head_col = (230, 195, 80, 255)     # gold head
-        tramp_col = (80, 160, 220, 255)    # blue trampoline
-        leg_col = (220, 180, 60, 255)      # gold legs
+        body_col = (180, 180, 180, 255)    # muted grey
+        head_col = (195, 195, 195, 255)    # slightly lighter head
+        motion_col = (140, 140, 140, 100)  # subtle motion lines
 
     def put(x, y, col):
         if 0 <= x < W and 0 <= y < H:
-            pixels[y][x] = col
+            # Alpha blend for anti-aliasing
+            existing = pixels[y][x]
+            if existing[3] == 0:
+                pixels[y][x] = col
+            else:
+                # Simple overwrite for now
+                pixels[y][x] = col
 
-    def line(x0, y0, x1, y1, col):
-        """Bresenham's line."""
-        dx = abs(x1 - x0)
-        dy = abs(y1 - y0)
-        sx = 1 if x0 < x1 else -1
-        sy = 1 if y0 < y1 else -1
-        err = dx - dy
-        while True:
-            put(x0, y0, col)
-            if x0 == x1 and y0 == y1:
-                break
-            e2 = 2 * err
-            if e2 > -dy:
-                err -= dy
-                x0 += sx
-            if e2 < dx:
-                err += dx
-                y0 += sy
+    def thick_line(x0, y0, x1, y1, col, thickness=2):
+        """Draw a line with thickness by offsetting perpendicular."""
+        dx = x1 - x0
+        dy = y1 - y0
+        length = math.sqrt(dx*dx + dy*dy)
+        if length == 0:
+            return
+        # Perpendicular unit vector
+        px = -dy / length
+        py = dx / length
+        for t in range(int(length * 2) + 1):
+            frac = t / (length * 2)
+            cx = x0 + dx * frac
+            cy = y0 + dy * frac
+            for offset in range(thickness):
+                off = (offset - (thickness - 1) / 2.0) * 0.5
+                put(int(round(cx + px * off)), int(round(cy + py * off)), col)
 
     def filled_circle(cx, cy, r, col):
         for dy in range(-r, r+1):
@@ -69,61 +73,68 @@ def draw_icon(bright=False):
                 if dx*dx + dy*dy <= r*r:
                     put(cx+dx, cy+dy, col)
 
-    # === Trampoline at bottom (y=27-28) ===
-    # Trampoline surface - curved line
-    for x in range(6, 26):
-        # slight curve
-        offset = int(0.5 + 1.2 * ((x - 16) ** 2) / 100)
-        y = 27 + offset
-        put(x, y, tramp_col)
-        if x >= 8 and x <= 23:
-            put(x, y - 1, tramp_col)  # thicker surface
+    def rotate(px, py, angle_deg, cx, cy):
+        """Rotate point (px,py) around (cx,cy) by angle_deg."""
+        rad = math.radians(angle_deg)
+        cos_a = math.cos(rad)
+        sin_a = math.sin(rad)
+        dx = px - cx
+        dy = py - cy
+        return (cx + dx * cos_a - dy * sin_a,
+                cy + dx * sin_a + dy * cos_a)
 
-    # Trampoline legs
-    line(7, 28, 5, 31, tramp_col)
-    line(24, 28, 26, 31, tramp_col)
+    # Define stick figure upside-down (head at bottom) centered at origin
+    # then rotate 30 degrees and translate to center of icon
+    angle = 30  # degrees clockwise
+    center_x, center_y = 16, 16
 
-    # === Upside-down stick figure (head at bottom, feet at top) ===
-    # The figure is inverted - they just flipped off the trampoline
+    # Figure points (relative, upside-down: head bottom, feet top)
+    head_y = 7      # head offset from center (below)
+    body_top = -1    # top of body (above center)
+    body_bot = 5     # bottom of body (near head)
+    arm_y = 2        # where arms attach
+    arm_spread = 7   # how far arms reach horizontally
+    arm_up = -2      # arms angle slightly up
+    leg_top_y = -1   # where legs start (top of body)
+    leg_end_y = -9   # where legs end (feet, way up)
+    leg_spread = 5   # how far legs spread
 
-    # Head (circle at bottom of figure, around y=22)
-    filled_circle(16, 22, 3, head_col)
+    def rp(rx, ry):
+        """Rotate a relative point around center."""
+        return rotate(center_x + rx, center_y + ry, angle, center_x, center_y)
 
-    # Body (line going up from head)
-    line(16, 19, 16, 10, body_col)
-    line(15, 19, 15, 10, body_col)  # 2px wide body
+    # Head
+    hx, hy = rp(0, head_y)
+    filled_circle(int(round(hx)), int(round(hy)), 3, head_col)
 
-    # Arms spread out (from mid-body, angled up-outward since upside down)
-    # Left arm - spread out and slightly up
-    line(15, 15, 8, 11, body_col)
-    line(15, 14, 8, 10, body_col)
+    # Body
+    bx0, by0 = rp(0, body_top)
+    bx1, by1 = rp(0, body_bot)
+    thick_line(int(round(bx0)), int(round(by0)), int(round(bx1)), int(round(by1)), body_col, 3)
+
+    # Left arm
+    ax0, ay0 = rp(0, arm_y)
+    ax1, ay1 = rp(-arm_spread, arm_y + arm_up)
+    thick_line(int(round(ax0)), int(round(ay0)), int(round(ax1)), int(round(ay1)), body_col, 2)
+
     # Right arm
-    line(16, 15, 23, 11, body_col)
-    line(16, 14, 23, 10, body_col)
+    ax2, ay2 = rp(arm_spread, arm_y + arm_up)
+    thick_line(int(round(ax0)), int(round(ay0)), int(round(ax2)), int(round(ay2)), body_col, 2)
 
-    # Legs spread in a V at the top (feet up in the air)
     # Left leg
-    line(15, 10, 10, 3, leg_col)
-    line(14, 10, 9, 3, leg_col)
+    lx0, ly0 = rp(0, leg_top_y)
+    lx1, ly1 = rp(-leg_spread, leg_end_y)
+    thick_line(int(round(lx0)), int(round(ly0)), int(round(lx1)), int(round(ly1)), body_col, 2)
+
     # Right leg
-    line(16, 10, 21, 3, leg_col)
-    line(17, 10, 22, 3, leg_col)
+    lx2, ly2 = rp(leg_spread, leg_end_y)
+    thick_line(int(round(lx0)), int(round(ly0)), int(round(lx2)), int(round(ly2)), body_col, 2)
 
-    # Small motion lines on sides to show movement
-    motion_col = (180, 180, 180, 120) if not bright else (220, 220, 220, 160)
-    # Left motion lines
-    put(5, 14, motion_col)
-    put(4, 15, motion_col)
-    put(5, 16, motion_col)
-    # Right motion lines
-    put(26, 14, motion_col)
-    put(27, 15, motion_col)
-    put(26, 16, motion_col)
-
-    # Upward motion lines above figure
-    for dy in range(3):
-        put(12, dy, motion_col)
-        put(19, dy, motion_col)
+    # Motion lines (small dashes near the figure to show movement)
+    for i, off_y in enumerate([-3, 0, 3]):
+        mx, my = rp(10, off_y)
+        put(int(round(mx)), int(round(my)), motion_col)
+        put(int(round(mx)) + 1, int(round(my)), motion_col)
 
     return pixels
 
