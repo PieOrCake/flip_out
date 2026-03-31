@@ -169,6 +169,15 @@ The seed data is sourced from the public GW2 API. The Trading Post is global acr
 - **nlohmann/json**: v3.11.3
 - Matched to [Hoard & Seek](https://github.com/PieOrCake/hoard_and_seek) for compatibility
 
+## Third-Party Licenses
+
+| Library | Version | License | Link |
+|---------|---------|---------|------|
+| [Dear ImGui](https://github.com/ocornut/imgui) | v1.80 | MIT | [License](https://github.com/ocornut/imgui/blob/master/LICENSE.txt) |
+| [nlohmann/json](https://github.com/nlohmann/json) | v3.11.3 | MIT | [License](https://github.com/nlohmann/json/blob/develop/LICENSE.MIT) |
+| [Nexus](https://raidcore.gg/Nexus) | API v6 | MIT | [License](https://github.com/RaidcoreGG/RCGG-lib-nexus-api/blob/main/LICENSE) |
+| [Hoard & Seek API](https://github.com/PieOrCake/hoard_and_seek) | v2 | MIT | [License](https://github.com/PieOrCake/hoard_and_seek/blob/main/LICENSE) |
+
 ## License
 
 MIT
