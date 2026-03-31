@@ -95,6 +95,32 @@ namespace FlipOut {
         int potential_profit = 0;     // profit_vs_avg * owned_count
     };
 
+    // A crafting profit opportunity
+    struct CraftingProfit {
+        uint32_t item_id = 0;           // output item ID
+        uint32_t recipe_id = 0;         // GW2 recipe ID (for H&S unlock query)
+        std::string name;
+        std::string rarity;
+        std::string recipe_type;        // e.g. "Weapon", "Armor", "Refinement"
+        int output_count = 1;           // how many the recipe produces
+        int ingredient_cost = 0;        // total cost to buy all ingredients (copper)
+        int sell_price = 0;             // TP sell price of output (copper)
+        int sell_revenue = 0;           // sell_price * output_count - tax
+        int profit = 0;                 // revenue - ingredient_cost (copper)
+        float roi = 0.0f;              // profit / ingredient_cost * 100
+        int sell_quantity = 0;          // TP sell volume (demand indicator)
+        std::vector<std::pair<uint32_t, int>> ingredients; // item_id, count
+    };
+
+    // Filter for crafting profit scanning
+    struct CraftingFilter {
+        int min_profit = 100;           // minimum copper profit per craft
+        float min_roi = 5.0f;           // minimum ROI percentage
+        int min_sell_volume = 10;       // minimum sell volume on TP
+        int max_results = 50;
+        int mode = 1;                   // 0=Fastest (instant buy + instant sell), 1=Balanced (instant buy + sell listing), 2=Patient (buy orders + sell listing)
+    };
+
     class Analyzer {
     public:
         // Calculate profit after TP tax
@@ -141,6 +167,10 @@ namespace FlipOut {
 
         // Format with just gold if large
         static std::string FormatCoinsShort(int copper);
+
+        // Find crafting profit opportunities from recipe data and current prices
+        static std::vector<CraftingProfit> FindCraftingProfits(
+            const CraftingFilter& filter = CraftingFilter{});
 
         // Get trend arrow character
         static const char* TrendArrow(Trend t);

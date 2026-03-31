@@ -15,6 +15,7 @@ namespace FlipOut {
     #define EV_FO_TX_SELLS_RESPONSE "EV_FLIPOUT_TX_SELLS_RESPONSE"
     #define REQUESTER_NAME          "Flip Out"
     #define EV_FO_CONTEXT_WATCH     "EV_FLIPOUT_WATCH_ITEM"
+    #define EV_FO_RECIPE_RESPONSE   "EV_FLIPOUT_RECIPE_RESPONSE"
     #define EV_FO_PERM_DISCARD      "EV_FLIPOUT_PERM_CHECK_DISCARD"
     #define EV_FO_PERM_DISCARD_ITEM "EV_FLIPOUT_PERM_CHECK_DISCARD_ITEM"
     #define FLIPOUT_SIGNATURE       0x1be8c2d6
@@ -31,7 +32,8 @@ namespace FlipOut {
     float HoardBridge::s_fetchProgress = 0.0f;
     bool HoardBridge::s_permissionPending = false;
     bool HoardBridge::s_permissionDenied = false;
-    std::chrono::steady_clock::time_point HoardBridge::s_permissionRetryTime;
+    std::vector<PendingRetry> HoardBridge::s_retryQueue;
+    std::unordered_map<int, int> HoardBridge::s_retryAttempts;
     std::unordered_set<uint32_t> HoardBridge::s_queriedItems;
     std::unordered_map<uint32_t, OwnedItem> HoardBridge::s_ownedItems;
     std::vector<TPTransaction> HoardBridge::s_currentBuys;
@@ -40,6 +42,10 @@ namespace FlipOut {
     bool HoardBridge::s_txLoaded = false;
     bool HoardBridge::s_txBuysReceived = false;
     bool HoardBridge::s_txSellsReceived = false;
+    std::unordered_set<uint32_t> HoardBridge::s_unlockedRecipes;
+    std::unordered_set<uint32_t> HoardBridge::s_queriedRecipes;
+    bool HoardBridge::s_recipeQueryDone = false;
+    int HoardBridge::s_recipeBatchesPending = 0;
     std::function<void(const std::string&)> HoardBridge::s_apiCallback;
     std::mutex HoardBridge::s_mutex;
 
@@ -59,6 +65,9 @@ namespace FlipOut {
         s_API->Events_Subscribe(EV_FO_API_RESPONSE, OnApiQueryResponse);
         s_API->Events_Subscribe(EV_FO_TX_BUYS_RESPONSE, OnTxBuysResponse);
         s_API->Events_Subscribe(EV_FO_TX_SELLS_RESPONSE, OnTxSellsResponse);
+
+        // Subscribe to recipe query response (MUST delete payload)
+        s_API->Events_Subscribe(EV_FO_RECIPE_RESPONSE, OnRecipeQueryResponse);
 
         // Subscribe to context menu callback (MUST delete payload)
         s_API->Events_Subscribe(EV_FO_CONTEXT_WATCH, OnContextMenuWatch);
@@ -87,6 +96,7 @@ namespace FlipOut {
         s_API->Events_Unsubscribe(EV_FO_API_RESPONSE, OnApiQueryResponse);
         s_API->Events_Unsubscribe(EV_FO_TX_BUYS_RESPONSE, OnTxBuysResponse);
         s_API->Events_Unsubscribe(EV_FO_TX_SELLS_RESPONSE, OnTxSellsResponse);
+        s_API->Events_Unsubscribe(EV_FO_RECIPE_RESPONSE, OnRecipeQueryResponse);
         s_API->Events_Unsubscribe(EV_FO_CONTEXT_WATCH, OnContextMenuWatch);
         s_API->Events_Unsubscribe(EV_FO_PERM_DISCARD, OnPermCheckDiscard);
         s_API->Events_Unsubscribe(EV_FO_PERM_DISCARD_ITEM, OnPermCheckDiscardItem);
@@ -100,21 +110,109 @@ namespace FlipOut {
     // --- Tick (called every frame from render loop) ---
 
     void HoardBridge::Tick() {
-        // If permission was pending and retry time has passed, clear the flag
-        if (s_permissionPending) {
-            auto now = std::chrono::steady_clock::now();
-            if (now >= s_permissionRetryTime) {
-                s_permissionPending = false;
-            }
-        }
+        // Process pending retries
+        ProcessRetries();
 
         // If a refresh is needed (after pong with data, or after data update), fire queries
         if (s_refreshNeeded && s_hoardDataAvailable && !s_permissionPending && !s_permissionDenied) {
             s_refreshNeeded = false;
-            // Note: specific item queries are fired on-demand from the UI (Search tab, etc.)
-            // The refreshNeeded flag just signals that caches were cleared and new queries can proceed
             if (s_API) {
                 s_API->Log(LOGL_INFO, "FlipOut", "H&S data refresh detected, caches cleared");
+            }
+        }
+    }
+
+    void HoardBridge::ScheduleRetry(RetryType type, const std::vector<uint32_t>& ids) {
+        int key = static_cast<int>(type);
+        int attempts = s_retryAttempts[key];
+
+        if (attempts >= RETRY_MAX) {
+            if (s_API) {
+                s_API->Log(LOGL_WARNING, "FlipOut", "H&S query max retries reached, giving up");
+            }
+            s_permissionPending = false;
+            s_retryAttempts.erase(key);
+            return;
+        }
+
+        s_retryAttempts[key] = attempts + 1;
+
+        std::lock_guard<std::mutex> lock(s_mutex);
+        PendingRetry retry;
+        retry.type = type;
+        retry.ids = ids;
+        retry.attempts = attempts + 1;
+        retry.retry_at = std::chrono::steady_clock::now() + std::chrono::milliseconds(RETRY_DELAY_MS);
+        s_retryQueue.push_back(std::move(retry));
+
+        if (s_API) {
+            std::string msg = "H&S permission pending, retry " + std::to_string(attempts + 1) + "/" + std::to_string(RETRY_MAX) + " in 2s";
+            s_API->Log(LOGL_INFO, "FlipOut", msg.c_str());
+        }
+    }
+
+    void HoardBridge::ResetRetryCount(RetryType type) {
+        s_retryAttempts.erase(static_cast<int>(type));
+    }
+
+    void HoardBridge::ProcessRetries() {
+        std::vector<PendingRetry> ready;
+        {
+            std::lock_guard<std::mutex> lock(s_mutex);
+            if (s_retryQueue.empty()) return;
+
+            auto now = std::chrono::steady_clock::now();
+            auto it = s_retryQueue.begin();
+            while (it != s_retryQueue.end()) {
+                if (now >= it->retry_at) {
+                    ready.push_back(std::move(*it));
+                    it = s_retryQueue.erase(it);
+                } else {
+                    ++it;
+                }
+            }
+        }
+
+        for (auto& r : ready) {
+            s_permissionPending = false; // Clear so the re-send isn't blocked
+
+            switch (r.type) {
+            case RetryType::ItemQuery:
+                if (s_API) {
+                    std::string msg = "Retrying H&S item query (attempt " + std::to_string(r.attempts + 1) + "/" + std::to_string(RETRY_MAX) + ")";
+                    s_API->Log(LOGL_INFO, "FlipOut", msg.c_str());
+                }
+                for (uint32_t id : r.ids) {
+                    s_queriedItems.erase(id);
+                    QueryItem(id);
+                }
+                break;
+
+            case RetryType::RecipeUnlock:
+                if (s_API) {
+                    std::string msg = "Retrying H&S recipe unlock query (attempt " + std::to_string(r.attempts + 1) + "/" + std::to_string(RETRY_MAX) + ")";
+                    s_API->Log(LOGL_INFO, "FlipOut", msg.c_str());
+                }
+                {
+                    std::lock_guard<std::mutex> lock(s_mutex);
+                    for (uint32_t id : r.ids) {
+                        s_queriedRecipes.erase(id);
+                    }
+                }
+                QueryRecipeUnlocks(r.ids);
+                break;
+
+            case RetryType::TransactionBuys:
+            case RetryType::TransactionSells:
+                if (s_API) {
+                    s_API->Log(LOGL_INFO, "FlipOut", "Retrying H&S transaction query");
+                }
+                {
+                    std::lock_guard<std::mutex> lock(s_mutex);
+                    s_txLoading = false;
+                }
+                FetchTransactions();
+                break;
             }
         }
     }
@@ -173,6 +271,75 @@ namespace FlipOut {
         strncpy(req.response_event, EV_FO_API_RESPONSE, sizeof(req.response_event));
 
         s_API->Events_Raise(EV_HOARD_QUERY_API, &req);
+    }
+
+    void HoardBridge::QueryRecipeUnlocks(const std::vector<uint32_t>& recipe_ids) {
+        if (!s_API || recipe_ids.empty()) return;
+        if (!s_hoardDataAvailable) return;
+        if (s_permissionPending || s_permissionDenied) return;
+
+        // Filter out already-queried recipe IDs
+        std::vector<uint32_t> to_query;
+        {
+            std::lock_guard<std::mutex> lock(s_mutex);
+            for (uint32_t id : recipe_ids) {
+                if (s_queriedRecipes.find(id) == s_queriedRecipes.end()) {
+                    to_query.push_back(id);
+                    s_queriedRecipes.insert(id);
+                }
+            }
+        }
+        if (to_query.empty()) return;
+
+        // Send in batches of 200 (H&S limit)
+        const size_t BATCH = 200;
+        int batches = 0;
+        for (size_t i = 0; i < to_query.size(); i += BATCH) {
+            HoardQueryRecipesRequest req{};
+            req.api_version = HOARD_API_VERSION;
+            strncpy(req.requester, REQUESTER_NAME, sizeof(req.requester));
+            strncpy(req.response_event, EV_FO_RECIPE_RESPONSE, sizeof(req.response_event));
+
+            size_t end = std::min(i + BATCH, to_query.size());
+            req.id_count = (uint32_t)(end - i);
+            for (size_t j = i; j < end; j++) {
+                req.ids[j - i] = to_query[j];
+            }
+
+            s_API->Events_Raise(EV_HOARD_QUERY_RECIPES, &req);
+            batches++;
+        }
+
+        {
+            std::lock_guard<std::mutex> lock(s_mutex);
+            s_recipeBatchesPending += batches;
+            s_recipeQueryDone = false;
+        }
+
+        if (s_API) {
+            std::string msg = "Querying H&S for " + std::to_string(to_query.size()) + " recipe unlocks";
+            s_API->Log(LOGL_INFO, "FlipOut", msg.c_str());
+        }
+    }
+
+    bool HoardBridge::IsRecipeUnlocked(uint32_t recipe_id) {
+        std::lock_guard<std::mutex> lock(s_mutex);
+        return s_unlockedRecipes.count(recipe_id) > 0;
+    }
+
+    bool HoardBridge::IsRecipeQueried(uint32_t recipe_id) {
+        std::lock_guard<std::mutex> lock(s_mutex);
+        return s_queriedRecipes.count(recipe_id) > 0;
+    }
+
+    size_t HoardBridge::GetUnlockedRecipeCount() {
+        std::lock_guard<std::mutex> lock(s_mutex);
+        return s_unlockedRecipes.size();
+    }
+
+    bool HoardBridge::IsRecipeQueryDone() {
+        std::lock_guard<std::mutex> lock(s_mutex);
+        return s_recipeQueryDone;
     }
 
     void HoardBridge::SearchInHoard(const std::string& item_name) {
@@ -434,6 +601,14 @@ namespace FlipOut {
         // Clear old cached data so it gets re-queried
         s_ownedItems.clear();
         s_queriedItems.clear();
+        s_unlockedRecipes.clear();
+        s_queriedRecipes.clear();
+        s_recipeQueryDone = false;
+        s_recipeBatchesPending = 0;
+        s_retryQueue.clear();
+        s_retryAttempts.clear();
+        s_permissionPending = false;
+        s_permissionDenied = false;
 
         if (s_API) {
             s_API->Log(LOGL_INFO, "FlipOut", "H&S data updated, caches cleared");
@@ -473,18 +648,21 @@ namespace FlipOut {
 
         if (resp->status == HOARD_STATUS_PENDING) {
             s_permissionPending = true;
-            s_permissionRetryTime = std::chrono::steady_clock::now() + std::chrono::seconds(3);
-            s_queriedItems.erase(resp->item_id); // Allow retry
+            uint32_t id = resp->item_id;
+            s_queriedItems.erase(id);
+            ScheduleRetry(RetryType::ItemQuery, {id});
             delete resp;
             return;
         }
         if (resp->status == HOARD_STATUS_DENIED) {
             s_permissionDenied = true;
+            ResetRetryCount(RetryType::ItemQuery);
             delete resp;
             return;
         }
 
         s_permissionPending = false;
+        ResetRetryCount(RetryType::ItemQuery);
 
         OwnedItem item;
         item.item_id = resp->item_id;
@@ -517,7 +695,10 @@ namespace FlipOut {
 
         if (resp->status == HOARD_STATUS_PENDING) {
             s_permissionPending = true;
-            s_permissionRetryTime = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+            // Generic API queries are not retryable (callback is one-shot)
+            if (s_API) {
+                s_API->Log(LOGL_INFO, "FlipOut", "H&S API query pending permission approval");
+            }
             delete resp;
             return;
         }
@@ -551,17 +732,22 @@ namespace FlipOut {
         if (resp->status != HOARD_STATUS_OK) {
             if (resp->status == HOARD_STATUS_PENDING) {
                 s_permissionPending = true;
-                s_permissionRetryTime = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+                {
+                    std::lock_guard<std::mutex> lock(s_mutex);
+                    s_txLoading = false;
+                }
+                ScheduleRetry(RetryType::TransactionBuys, {});
             } else if (resp->status == HOARD_STATUS_DENIED) {
                 s_permissionDenied = true;
+                std::lock_guard<std::mutex> lock(s_mutex);
+                s_txLoading = false;
             }
-            std::lock_guard<std::mutex> lock(s_mutex);
-            s_txLoading = false;
             delete resp;
             return;
         }
 
         s_permissionPending = false;
+        ResetRetryCount(RetryType::TransactionBuys);
 
         std::string jsonStr(resp->json, std::min((uint32_t)sizeof(resp->json) - 1, resp->json_length));
         auto txs = ParseTransactionsJson(jsonStr);
@@ -593,17 +779,22 @@ namespace FlipOut {
         if (resp->status != HOARD_STATUS_OK) {
             if (resp->status == HOARD_STATUS_PENDING) {
                 s_permissionPending = true;
-                s_permissionRetryTime = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+                {
+                    std::lock_guard<std::mutex> lock(s_mutex);
+                    s_txLoading = false;
+                }
+                ScheduleRetry(RetryType::TransactionSells, {});
             } else if (resp->status == HOARD_STATUS_DENIED) {
                 s_permissionDenied = true;
+                std::lock_guard<std::mutex> lock(s_mutex);
+                s_txLoading = false;
             }
-            std::lock_guard<std::mutex> lock(s_mutex);
-            s_txLoading = false;
             delete resp;
             return;
         }
 
         s_permissionPending = false;
+        ResetRetryCount(RetryType::TransactionSells);
 
         std::string jsonStr(resp->json, std::min((uint32_t)sizeof(resp->json) - 1, resp->json_length));
         auto txs = ParseTransactionsJson(jsonStr);
@@ -622,6 +813,61 @@ namespace FlipOut {
         std::vector<uint32_t> ids;
         for (const auto& t : txs) ids.push_back(t.item_id);
         if (!ids.empty()) TPAPI::FetchItemInfo(ids);
+
+        delete resp;
+    }
+
+    void HoardBridge::OnRecipeQueryResponse(void* eventArgs) {
+        if (!eventArgs) return;
+        HoardQueryRecipesResponse* resp = static_cast<HoardQueryRecipesResponse*>(eventArgs);
+
+        if (resp->api_version != HOARD_API_VERSION) { delete resp; return; }
+
+        if (resp->status == HOARD_STATUS_PENDING) {
+            s_permissionPending = true;
+            // Collect all currently queried recipe IDs for retry
+            std::vector<uint32_t> retryIds;
+            {
+                std::lock_guard<std::mutex> lock(s_mutex);
+                retryIds.assign(s_queriedRecipes.begin(), s_queriedRecipes.end());
+                s_queriedRecipes.clear();
+                s_recipeBatchesPending = 0;
+            }
+            ScheduleRetry(RetryType::RecipeUnlock, retryIds);
+            delete resp;
+            return;
+        }
+        if (resp->status == HOARD_STATUS_DENIED) {
+            s_permissionDenied = true;
+            {
+                std::lock_guard<std::mutex> lock(s_mutex);
+                s_recipeBatchesPending = std::max(0, s_recipeBatchesPending - 1);
+                if (s_recipeBatchesPending <= 0) s_recipeQueryDone = true;
+            }
+            delete resp;
+            return;
+        }
+
+        s_permissionPending = false;
+        ResetRetryCount(RetryType::RecipeUnlock);
+
+        {
+            std::lock_guard<std::mutex> lock(s_mutex);
+            for (uint32_t i = 0; i < resp->entry_count && i < 200; i++) {
+                if (resp->entries[i].unlocked) {
+                    s_unlockedRecipes.insert(resp->entries[i].id);
+                }
+            }
+            s_recipeBatchesPending = std::max(0, s_recipeBatchesPending - 1);
+            if (s_recipeBatchesPending <= 0) {
+                s_recipeQueryDone = true;
+            }
+        }
+
+        if (s_API && s_recipeQueryDone) {
+            std::string msg = "Recipe unlock query complete: " + std::to_string(s_unlockedRecipes.size()) + " unlocked";
+            s_API->Log(LOGL_INFO, "FlipOut", msg.c_str());
+        }
 
         delete resp;
     }

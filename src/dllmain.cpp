@@ -1,4 +1,5 @@
 #include <windows.h>
+#include <shellapi.h>
 #include <string>
 #include <vector>
 #include <cstring>
@@ -7,6 +8,7 @@
 #include <thread>
 #include <chrono>
 #include <cfloat>
+#include <unordered_set>
 
 #include "nexus/Nexus.h"
 #include "imgui.h"
@@ -20,7 +22,7 @@
 
 // Version constants
 #define V_MAJOR 0
-#define V_MINOR 1
+#define V_MINOR 9
 #define V_BUILD 0
 #define V_REVISION 0
 
@@ -74,9 +76,10 @@ HMODULE hSelf;
 AddonDefinition_t AddonDef{};
 AddonAPI_t* APIDefs = nullptr;
 bool g_WindowVisible = false;
+static bool g_ShowQAIcon = true;
 
 // UI State
-static int g_ActiveTab = 0; // 0=Flips, 1=Watchlist, 2=Transactions, 3=Search
+static int g_ActiveTab = 0; // 0=Flips, 1=Watchlist, 2=Transactions, 3=Crafting, 4=Search
 
 // Flip scanner state
 static std::vector<FlipOut::FlipOpportunity> g_Flips;
@@ -98,6 +101,32 @@ static uint32_t g_PriceHistoryItemId = 0;
 static std::string g_PriceHistoryItemName;
 static std::string g_PriceHistoryItemRarity;
 static int g_PriceHistoryRange = 2; // 0=1D, 1=1W, 2=1M, 3=3M, 4=6M
+
+// Crafting state
+static std::vector<FlipOut::CraftingProfit> g_CraftingProfits;
+static FlipOut::CraftingFilter g_CraftingFilter;
+static bool g_CraftingDirty = true;
+static bool g_CraftingKnownOnly = false;
+static bool g_CraftingRecipesQueried = false;
+static bool g_CraftingIngredientsQueried = false;
+static int g_CraftingMode = 1; // 0=Fastest, 1=Balanced, 2=Patient
+
+// Liquidate tab state
+struct LiquidateEntry {
+    uint32_t item_id;
+    std::string name;
+    std::string rarity;
+    std::string icon_url;
+    int count;
+    int buy_price;      // sell to buy orders (instant gold)
+    int sell_price;      // list on TP
+    int total_instant;   // count * buy_price
+    int total_listed;    // count * sell_price * 0.85 (after 15% tax)
+};
+static std::vector<LiquidateEntry> g_LiquidateItems;
+static bool g_LiquidateLoading = false;
+static bool g_LiquidateLoaded = false;
+static std::chrono::steady_clock::time_point g_LiquidateScanStart;
 
 // Search state
 static char g_SearchBuf[256] = "";
@@ -191,21 +220,33 @@ static void RenderItemIcon(uint32_t itemId, const std::string& iconUrl,
 }
 
 // Coin display helper with gold/silver/copper coloring
+static const ImVec4 COL_GOLD   = ImVec4(1.0f, 0.85f, 0.0f, 1.0f);
+static const ImVec4 COL_SILVER = ImVec4(0.75f, 0.75f, 0.8f, 1.0f);
+static const ImVec4 COL_COPPER = ImVec4(0.72f, 0.45f, 0.2f, 1.0f);
+
 static void RenderCoins(int copper) {
     if (copper < 0) {
-        ImGui::TextColored(ImVec4(1.0f, 0.3f, 0.3f, 1.0f), "-%s",
-            FlipOut::Analyzer::FormatCoinsShort(-copper).c_str());
+        ImGui::TextColored(ImVec4(1.0f, 0.3f, 0.3f, 1.0f), "-");
+        ImGui::SameLine(0, 0);
+        RenderCoins(-copper);
         return;
     }
     int gold = copper / 10000;
     int silver = (copper % 10000) / 100;
     int cop = copper % 100;
 
-    std::string text;
-    if (gold > 0) text += std::to_string(gold) + "g ";
-    if (silver > 0 || gold > 0) text += std::to_string(silver) + "s ";
-    text += std::to_string(cop) + "c";
-    ImGui::TextColored(ImVec4(1.0f, 0.85f, 0.0f, 1.0f), "%s", text.c_str());
+    bool needSpace = false;
+    if (gold > 0) {
+        ImGui::TextColored(COL_GOLD, "%dg", gold);
+        needSpace = true;
+    }
+    if (silver > 0 || gold > 0) {
+        if (needSpace) { ImGui::SameLine(0, 2); }
+        ImGui::TextColored(COL_SILVER, "%ds", silver);
+        needSpace = true;
+    }
+    if (needSpace) { ImGui::SameLine(0, 2); }
+    ImGui::TextColored(COL_COPPER, "%dc", cop);
 }
 
 // Trend indicator
@@ -362,7 +403,9 @@ static void RenderPriceHistoryWindow() {
         if (g_PriceHistoryRange == 0) {
             strftime(tbuf, sizeof(tbuf), "%H:%M", tm_info);
         } else {
-            strftime(tbuf, sizeof(tbuf), "%m/%d", tm_info);
+            char mon[8];
+            strftime(mon, sizeof(mon), "%b", tm_info);
+            snprintf(tbuf, sizeof(tbuf), "%d %s", tm_info->tm_mday, mon);
         }
         ImVec2 text_size = ImGui::CalcTextSize(tbuf);
         dl->AddText(ImVec2(x - text_size.x * 0.5f, gp.y + graph_h + 4),
@@ -508,34 +551,36 @@ static void RenderFlipsTab() {
             FlipOut::TPAPI::GetBulkFetchMessage().c_str());
     } else {
         bool canScan = CanScan();
+        // Fixed-width button to prevent layout shift when label changes
+        float btnW = ImGui::CalcTextSize("Scan Market (00:00)").x + ImGui::GetStyle().FramePadding.x * 2;
         if (!canScan) {
+            int cd = ScanCooldownRemaining();
+            char label[64];
+            snprintf(label, sizeof(label), "Scan Market (%d:%02d)", cd / 60, cd % 60);
             ImGui::PushStyleVar(ImGuiStyleVar_Alpha, 0.4f);
-            ImGui::Button("Scan Market");
+            ImGui::Button(label, ImVec2(btnW, 0));
             ImGui::PopStyleVar();
         } else {
-            if (ImGui::Button("Scan Market")) {
+            if (ImGui::Button("Scan Market", ImVec2(btnW, 0))) {
                 FlipOut::TPAPI::FetchAllPricesAsync();
                 g_FlipsDirty = true;
             }
         }
         ImGui::SameLine();
-        if (!canScan) {
-            int cd = ScanCooldownRemaining();
-            ImGui::TextColored(ImVec4(0.5f, 0.5f, 0.5f, 1.0f), "Cooldown: %d:%02d",
-                cd / 60, cd % 60);
-        } else if (fetchStatus == FlipOut::FetchStatus::Success) {
+        if (fetchStatus == FlipOut::FetchStatus::Success) {
             ImGui::TextColored(ImVec4(0.35f, 0.82f, 0.35f, 1.0f), "%s",
                 FlipOut::TPAPI::GetBulkFetchMessage().c_str());
         } else if (fetchStatus == FlipOut::FetchStatus::Error) {
             ImGui::TextColored(ImVec4(1.0f, 0.3f, 0.3f, 1.0f), "%s",
                 FlipOut::TPAPI::GetBulkFetchMessage().c_str());
+        } else if (!canScan) {
+            // nothing — cooldown is in the button label
         } else {
             const auto& msg = FlipOut::TPAPI::GetBulkFetchMessage();
             if (!msg.empty()) {
                 ImGui::TextColored(ImVec4(0.6f, 0.6f, 0.6f, 1.0f), "%s", msg.c_str());
             }
         }
-        // Show last scan timestamp
         if (g_HasScanned) {
             ImGui::SameLine();
             ImGui::TextColored(ImVec4(0.5f, 0.5f, 0.5f, 1.0f), "| Last scan: %s",
@@ -548,6 +593,7 @@ static void RenderFlipsTab() {
         static FlipOut::FetchStatus s_prevStatus = FlipOut::FetchStatus::Idle;
         if (fetchStatus == FlipOut::FetchStatus::Success && s_prevStatus != FlipOut::FetchStatus::Success) {
             g_FlipsDirty = true;
+            g_CraftingDirty = true;
             g_HasScanned = true;
             g_LastScanTime = std::chrono::steady_clock::now();
             // Record current prices into history DB
@@ -618,7 +664,8 @@ static void RenderFlipsTab() {
 
             if (ImGui::BeginTable("##sell_opps", 7,
                 ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg |
-                ImGuiTableFlags_Resizable | ImGuiTableFlags_SizingStretchProp,
+                ImGuiTableFlags_Resizable | ImGuiTableFlags_SizingStretchProp |
+                ImGuiTableFlags_Sortable | ImGuiTableFlags_ScrollY,
                 ImVec2(0, std::min((float)g_SellOpps.size() * 28.0f + 30.0f, 250.0f))))
             {
                 ImGui::TableSetupColumn("Item", ImGuiTableColumnFlags_WidthStretch, 3.0f);
@@ -627,9 +674,30 @@ static void RenderFlipsTab() {
                 ImGui::TableSetupColumn("Avg Sell", ImGuiTableColumnFlags_WidthFixed, 85.0f);
                 ImGui::TableSetupColumn("Above Avg", ImGuiTableColumnFlags_WidthFixed, 60.0f);
                 ImGui::TableSetupColumn("Profit/Unit", ImGuiTableColumnFlags_WidthFixed, 80.0f);
-                ImGui::TableSetupColumn("Total Profit", ImGuiTableColumnFlags_WidthFixed, 85.0f);
+                ImGui::TableSetupColumn("Total Profit", ImGuiTableColumnFlags_WidthFixed | ImGuiTableColumnFlags_DefaultSort | ImGuiTableColumnFlags_PreferSortDescending, 85.0f);
                 ImGui::TableSetupScrollFreeze(0, 1);
                 ImGui::TableHeadersRow();
+
+                if (ImGuiTableSortSpecs* specs = ImGui::TableGetSortSpecs()) {
+                    if (specs->SpecsDirty && specs->SpecsCount > 0) {
+                        const auto& s = specs->Specs[0];
+                        bool asc = s.SortDirection == ImGuiSortDirection_Ascending;
+                        std::sort(g_SellOpps.begin(), g_SellOpps.end(), [&](const FlipOut::SellOpportunity& a, const FlipOut::SellOpportunity& b) {
+                            int cmp = 0;
+                            switch (s.ColumnIndex) {
+                                case 0: cmp = a.name.compare(b.name); break;
+                                case 1: cmp = a.owned_count - b.owned_count; break;
+                                case 2: cmp = a.current_sell - b.current_sell; break;
+                                case 3: cmp = a.avg_sell - b.avg_sell; break;
+                                case 4: cmp = (a.price_increase_pct > b.price_increase_pct) - (a.price_increase_pct < b.price_increase_pct); break;
+                                case 5: cmp = a.profit_vs_avg - b.profit_vs_avg; break;
+                                case 6: cmp = a.potential_profit - b.potential_profit; break;
+                            }
+                            return asc ? cmp < 0 : cmp > 0;
+                        });
+                        specs->SpecsDirty = false;
+                    }
+                }
 
                 for (const auto& opp : g_SellOpps) {
                     ImGui::TableNextRow(0, ICON_SIZE + 4);
@@ -690,13 +758,11 @@ static void RenderFlipsTab() {
 
                     // Profit per unit vs avg
                     ImGui::TableNextColumn();
-                    ImGui::TextColored(ImVec4(0.35f, 0.82f, 0.35f, 1.0f), "%s",
-                        FlipOut::Analyzer::FormatCoinsShort(opp.profit_vs_avg).c_str());
+                    RenderCoins(opp.profit_vs_avg);
 
                     // Total potential profit
                     ImGui::TableNextColumn();
-                    ImGui::TextColored(ImVec4(0.35f, 0.82f, 0.35f, 1.0f), "%s",
-                        FlipOut::Analyzer::FormatCoinsShort(opp.potential_profit).c_str());
+                    RenderCoins(opp.potential_profit);
 
                     ImGui::PopID();
                 }
@@ -718,7 +784,8 @@ static void RenderFlipsTab() {
 
             if (ImGui::BeginTable("##movers", 7,
                 ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg |
-                ImGuiTableFlags_Resizable | ImGuiTableFlags_SizingStretchProp,
+                ImGuiTableFlags_Resizable | ImGuiTableFlags_SizingStretchProp |
+                ImGuiTableFlags_Sortable | ImGuiTableFlags_ScrollY,
                 ImVec2(0, std::min((float)g_MarketMovers.size() * 28.0f + 30.0f, 250.0f))))
             {
                 ImGui::TableSetupColumn("Item", ImGuiTableColumnFlags_WidthStretch, 3.0f);
@@ -727,9 +794,30 @@ static void RenderFlipsTab() {
                 ImGui::TableSetupColumn("Price", ImGuiTableColumnFlags_WidthFixed, 55.0f);
                 ImGui::TableSetupColumn("Buy Vol", ImGuiTableColumnFlags_WidthFixed, 65.0f);
                 ImGui::TableSetupColumn("Vol", ImGuiTableColumnFlags_WidthFixed, 55.0f);
-                ImGui::TableSetupColumn("Score", ImGuiTableColumnFlags_WidthFixed, 50.0f);
+                ImGui::TableSetupColumn("Score", ImGuiTableColumnFlags_WidthFixed | ImGuiTableColumnFlags_DefaultSort | ImGuiTableColumnFlags_PreferSortDescending, 50.0f);
                 ImGui::TableSetupScrollFreeze(0, 1);
                 ImGui::TableHeadersRow();
+
+                if (ImGuiTableSortSpecs* specs = ImGui::TableGetSortSpecs()) {
+                    if (specs->SpecsDirty && specs->SpecsCount > 0) {
+                        const auto& s = specs->Specs[0];
+                        bool asc = s.SortDirection == ImGuiSortDirection_Ascending;
+                        std::sort(g_MarketMovers.begin(), g_MarketMovers.end(), [&](const FlipOut::MarketMover& a, const FlipOut::MarketMover& b) {
+                            int cmp = 0;
+                            switch (s.ColumnIndex) {
+                                case 0: cmp = a.name.compare(b.name); break;
+                                case 1: cmp = a.current_sell - b.current_sell; break;
+                                case 2: cmp = a.avg_sell - b.avg_sell; break;
+                                case 3: cmp = (a.price_change_pct > b.price_change_pct) - (a.price_change_pct < b.price_change_pct); break;
+                                case 4: cmp = a.current_buy_qty - b.current_buy_qty; break;
+                                case 5: cmp = (a.volume_change_pct > b.volume_change_pct) - (a.volume_change_pct < b.volume_change_pct); break;
+                                case 6: cmp = (a.spike_score > b.spike_score) - (a.spike_score < b.spike_score); break;
+                            }
+                            return asc ? cmp < 0 : cmp > 0;
+                        });
+                        specs->SpecsDirty = false;
+                    }
+                }
 
                 for (const auto& m : g_MarketMovers) {
                     const auto* owned_m = FlipOut::HoardBridge::GetOwnedItem(m.item_id);
@@ -842,12 +930,33 @@ static void RenderFlipsTab() {
         ImGui::TableSetupColumn("Item", ImGuiTableColumnFlags_WidthStretch, 3.0f);
         ImGui::TableSetupColumn("Buy", ImGuiTableColumnFlags_WidthFixed, 80.0f);
         ImGui::TableSetupColumn("Sell", ImGuiTableColumnFlags_WidthFixed, 80.0f);
-        ImGui::TableSetupColumn("Profit", ImGuiTableColumnFlags_WidthFixed, 80.0f);
+        ImGui::TableSetupColumn("Profit", ImGuiTableColumnFlags_WidthFixed | ImGuiTableColumnFlags_DefaultSort | ImGuiTableColumnFlags_PreferSortDescending, 80.0f);
         ImGui::TableSetupColumn("Margin", ImGuiTableColumnFlags_WidthFixed, 55.0f);
         ImGui::TableSetupColumn("ROI", ImGuiTableColumnFlags_WidthFixed, 50.0f);
         ImGui::TableSetupColumn("Volume", ImGuiTableColumnFlags_WidthFixed, 60.0f);
         ImGui::TableSetupScrollFreeze(0, 1);
         ImGui::TableHeadersRow();
+
+        if (ImGuiTableSortSpecs* specs = ImGui::TableGetSortSpecs()) {
+            if (specs->SpecsDirty && specs->SpecsCount > 0) {
+                const auto& s = specs->Specs[0];
+                bool asc = s.SortDirection == ImGuiSortDirection_Ascending;
+                std::sort(g_Flips.begin(), g_Flips.end(), [&](const FlipOut::FlipOpportunity& a, const FlipOut::FlipOpportunity& b) {
+                    int cmp = 0;
+                    switch (s.ColumnIndex) {
+                        case 0: cmp = a.name.compare(b.name); break;
+                        case 1: cmp = a.buy_price - b.buy_price; break;
+                        case 2: cmp = a.sell_price - b.sell_price; break;
+                        case 3: cmp = a.profit_per_unit - b.profit_per_unit; break;
+                        case 4: cmp = (a.margin_pct > b.margin_pct) - (a.margin_pct < b.margin_pct); break;
+                        case 5: cmp = (a.roi > b.roi) - (a.roi < b.roi); break;
+                        case 6: cmp = (a.buy_quantity + a.sell_quantity) - (b.buy_quantity + b.sell_quantity); break;
+                    }
+                    return asc ? cmp < 0 : cmp > 0;
+                });
+                specs->SpecsDirty = false;
+            }
+        }
 
         for (const auto& flip : g_Flips) {
             const auto* owned_f = FlipOut::HoardBridge::GetOwnedItem(flip.item_id);
@@ -911,11 +1020,7 @@ static void RenderFlipsTab() {
 
             // Profit
             ImGui::TableNextColumn();
-            ImVec4 profitColor = flip.profit_per_unit > 0
-                ? ImVec4(0.35f, 0.82f, 0.35f, 1.0f)
-                : ImVec4(1.0f, 0.3f, 0.3f, 1.0f);
-            ImGui::TextColored(profitColor, "%s",
-                FlipOut::Analyzer::FormatCoinsShort(flip.profit_per_unit).c_str());
+            RenderCoins(flip.profit_per_unit);
 
             // Margin %
             ImGui::TableNextColumn();
@@ -986,9 +1091,11 @@ static void RenderWatchlistTab() {
     ImGui::Text("%d items watched", (int)watchlist.size());
     ImGui::Separator();
 
+    auto prices_wl = FlipOut::TPAPI::GetAllPrices();
+
     if (ImGui::BeginTable("##watchlist", 9,
         ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY |
-        ImGuiTableFlags_Resizable | ImGuiTableFlags_SizingStretchProp,
+        ImGuiTableFlags_Resizable | ImGuiTableFlags_SizingStretchProp | ImGuiTableFlags_Sortable,
         ImVec2(0, ImGui::GetContentRegionAvail().y - 4)))
     {
         ImGui::TableSetupColumn("Item", ImGuiTableColumnFlags_WidthStretch, 3.0f);
@@ -999,15 +1106,44 @@ static void RenderWatchlistTab() {
         ImGui::TableSetupColumn("Buy Trend", ImGuiTableColumnFlags_WidthFixed, 55.0f);
         ImGui::TableSetupColumn("Sell Trend", ImGuiTableColumnFlags_WidthFixed, 55.0f);
         ImGui::TableSetupColumn("History", ImGuiTableColumnFlags_WidthFixed, 50.0f);
-        ImGui::TableSetupColumn("##remove", ImGuiTableColumnFlags_WidthFixed, 30.0f);
+        ImGui::TableSetupColumn("##remove", ImGuiTableColumnFlags_WidthFixed | ImGuiTableColumnFlags_NoSort, 30.0f);
         ImGui::TableSetupScrollFreeze(0, 1);
         ImGui::TableHeadersRow();
-
-        auto prices = FlipOut::TPAPI::GetAllPrices();
 
         // Copy watchlist to iterate safely
         auto wl_copy = watchlist;
         uint32_t removeId = 0;
+
+        if (ImGuiTableSortSpecs* specs = ImGui::TableGetSortSpecs()) {
+            if (specs->SpecsDirty && specs->SpecsCount > 0) {
+                const auto& s = specs->Specs[0];
+                bool asc = s.SortDirection == ImGuiSortDirection_Ascending;
+                std::sort(wl_copy.begin(), wl_copy.end(), [&](const FlipOut::WatchlistEntry& a, const FlipOut::WatchlistEntry& b) {
+                    const auto* ai = FlipOut::TPAPI::GetItemInfo(a.item_id);
+                    const auto* bi = FlipOut::TPAPI::GetItemInfo(b.item_id);
+                    auto pa = prices_wl.find(a.item_id);
+                    auto pb = prices_wl.find(b.item_id);
+                    int ab = pa != prices_wl.end() ? pa->second.buy_price : 0;
+                    int as_ = pa != prices_wl.end() ? pa->second.sell_price : 0;
+                    int bb_ = pb != prices_wl.end() ? pb->second.buy_price : 0;
+                    int bs = pb != prices_wl.end() ? pb->second.sell_price : 0;
+                    int cmp = 0;
+                    switch (s.ColumnIndex) {
+                        case 0: { std::string an = ai ? ai->name : ""; std::string bn = bi ? bi->name : ""; cmp = an.compare(bn); } break;
+                        case 1: cmp = ab - bb_; break;
+                        case 2: cmp = as_ - bs; break;
+                        case 3: { int ap = (ab > 0 && as_ > 0) ? FlipOut::Analyzer::CalcProfit(ab, as_) : 0;
+                                  int bp = (bb_ > 0 && bs > 0) ? FlipOut::Analyzer::CalcProfit(bb_, bs) : 0;
+                                  cmp = ap - bp; } break;
+                        case 4: { float am = (ab > 0 && as_ > 0) ? FlipOut::Analyzer::CalcMargin(ab, as_) : 0;
+                                  float bm = (bb_ > 0 && bs > 0) ? FlipOut::Analyzer::CalcMargin(bb_, bs) : 0;
+                                  cmp = (am > bm) - (am < bm); } break;
+                    }
+                    return asc ? cmp < 0 : cmp > 0;
+                });
+                specs->SpecsDirty = false;
+            }
+        }
 
         for (const auto& entry : wl_copy) {
             ImGui::TableNextRow(0, ICON_SIZE + 4);
@@ -1018,12 +1154,26 @@ static void RenderWatchlistTab() {
             std::string rarity = info ? info->rarity : "";
             std::string iconUrl = info ? info->icon_url : "";
 
-            auto priceIt = prices.find(entry.item_id);
-            int buy = priceIt != prices.end() ? priceIt->second.buy_price : 0;
-            int sell = priceIt != prices.end() ? priceIt->second.sell_price : 0;
+            auto priceIt = prices_wl.find(entry.item_id);
+            int buy = priceIt != prices_wl.end() ? priceIt->second.buy_price : 0;
+            int sell = priceIt != prices_wl.end() ? priceIt->second.sell_price : 0;
 
             // Item
             ImGui::TableNextColumn();
+            ImGui::Selectable("##row", false,
+                ImGuiSelectableFlags_SpanAllColumns | ImGuiSelectableFlags_AllowItemOverlap,
+                ImVec2(0, ICON_SIZE));
+            if (ImGui::BeginPopupContextItem("##wl_ctx")) {
+                if (ImGui::MenuItem("Search in Hoard & Seek")) {
+                    FlipOut::HoardBridge::SearchInHoard(name);
+                }
+                ImGui::Separator();
+                if (ImGui::MenuItem("View Price History")) {
+                    OpenPriceHistory(entry.item_id, name, rarity);
+                }
+                ImGui::EndPopup();
+            }
+            ImGui::SameLine(0, 0);
             RenderItemIcon(entry.item_id, iconUrl, rarity);
             ImGui::SameLine();
             ImGui::TextColored(GetRarityColor(rarity), "%s", name.c_str());
@@ -1042,8 +1192,7 @@ static void RenderWatchlistTab() {
             ImGui::TableNextColumn();
             if (buy > 0 && sell > 0) {
                 int profit = FlipOut::Analyzer::CalcProfit(buy, sell);
-                ImVec4 col = profit > 0 ? ImVec4(0.35f, 0.82f, 0.35f, 1.0f) : ImVec4(1.0f, 0.3f, 0.3f, 1.0f);
-                ImGui::TextColored(col, "%s", FlipOut::Analyzer::FormatCoinsShort(profit).c_str());
+                RenderCoins(profit);
             } else {
                 ImGui::TextColored(ImVec4(0.5f, 0.5f, 0.5f, 1.0f), "---");
             }
@@ -1133,8 +1282,8 @@ static void RenderTransactionsTab() {
 
     ImGui::Separator();
 
-    const auto& currentBuys = FlipOut::HoardBridge::GetCurrentBuys();
-    const auto& currentSells = FlipOut::HoardBridge::GetCurrentSells();
+    auto currentBuys = FlipOut::HoardBridge::GetCurrentBuys();
+    auto currentSells = FlipOut::HoardBridge::GetCurrentSells();
 
     // Pending Buys
     if (ImGui::CollapsingHeader("Pending Buy Orders", ImGuiTreeNodeFlags_DefaultOpen)) {
@@ -1142,20 +1291,63 @@ static void RenderTransactionsTab() {
             ImGui::TextColored(ImVec4(0.6f, 0.6f, 0.6f, 1.0f), "No pending buy orders.");
         } else {
             if (ImGui::BeginTable("##txbuys", 4,
-                ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_SizingStretchProp))
+                ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_SizingStretchProp |
+                ImGuiTableFlags_Sortable))
             {
                 ImGui::TableSetupColumn("Item", ImGuiTableColumnFlags_WidthStretch, 3.0f);
-                ImGui::TableSetupColumn("Price", ImGuiTableColumnFlags_WidthFixed, 80.0f);
+                ImGui::TableSetupColumn("Price", ImGuiTableColumnFlags_WidthFixed | ImGuiTableColumnFlags_DefaultSort | ImGuiTableColumnFlags_PreferSortDescending, 80.0f);
                 ImGui::TableSetupColumn("Qty", ImGuiTableColumnFlags_WidthFixed, 40.0f);
                 ImGui::TableSetupColumn("Created", ImGuiTableColumnFlags_WidthFixed, 120.0f);
                 ImGui::TableHeadersRow();
 
+                if (ImGuiTableSortSpecs* specs = ImGui::TableGetSortSpecs()) {
+                    if (specs->SpecsDirty && specs->SpecsCount > 0) {
+                        const auto& s = specs->Specs[0];
+                        bool asc = s.SortDirection == ImGuiSortDirection_Ascending;
+                        std::sort(currentBuys.begin(), currentBuys.end(), [&](const FlipOut::TPTransaction& a, const FlipOut::TPTransaction& b) {
+                            int cmp = 0;
+                            switch (s.ColumnIndex) {
+                                case 0: { const auto* ai = FlipOut::TPAPI::GetItemInfo(a.item_id); const auto* bi = FlipOut::TPAPI::GetItemInfo(b.item_id);
+                                          std::string an = ai ? ai->name : ""; std::string bn = bi ? bi->name : "";
+                                          cmp = an.compare(bn); } break;
+                                case 1: cmp = a.price - b.price; break;
+                                case 2: cmp = a.quantity - b.quantity; break;
+                                case 3: cmp = a.created.compare(b.created); break;
+                            }
+                            return asc ? cmp < 0 : cmp > 0;
+                        });
+                        specs->SpecsDirty = false;
+                    }
+                }
+
                 for (const auto& tx : currentBuys) {
                     ImGui::TableNextRow();
+                    ImGui::PushID((int)tx.item_id ^ 0x42555900);
                     ImGui::TableNextColumn();
                     const auto* info = FlipOut::TPAPI::GetItemInfo(tx.item_id);
                     std::string name = info ? info->name : ("Item #" + std::to_string(tx.item_id));
                     std::string rarity = info ? info->rarity : "";
+                    ImGui::Selectable("##row", false,
+                        ImGuiSelectableFlags_SpanAllColumns | ImGuiSelectableFlags_AllowItemOverlap);
+                    if (ImGui::BeginPopupContextItem("##txb_ctx")) {
+                        bool watched = FlipOut::PriceDB::IsOnWatchlist(tx.item_id);
+                        if (watched) {
+                            if (ImGui::MenuItem("Remove from Watchlist")) {
+                                FlipOut::PriceDB::RemoveFromWatchlist(tx.item_id);
+                                FlipOut::PriceDB::SaveWatchlist();
+                            }
+                        } else {
+                            if (ImGui::MenuItem("Add to Watchlist")) {
+                                FlipOut::PriceDB::AddToWatchlist(tx.item_id);
+                                FlipOut::PriceDB::SaveWatchlist();
+                            }
+                        }
+                        if (ImGui::MenuItem("Search in Hoard & Seek")) {
+                            FlipOut::HoardBridge::SearchInHoard(name);
+                        }
+                        ImGui::EndPopup();
+                    }
+                    ImGui::SameLine(0, 0);
                     ImGui::TextColored(GetRarityColor(rarity), "%s", name.c_str());
 
                     ImGui::TableNextColumn();
@@ -1169,6 +1361,7 @@ static void RenderTransactionsTab() {
                         ImGui::Text("%s", tx.created.substr(0, 10).c_str());
                     else
                         ImGui::Text("---");
+                    ImGui::PopID();
                 }
                 ImGui::EndTable();
             }
@@ -1181,20 +1374,63 @@ static void RenderTransactionsTab() {
             ImGui::TextColored(ImVec4(0.6f, 0.6f, 0.6f, 1.0f), "No pending sell listings.");
         } else {
             if (ImGui::BeginTable("##txsells", 4,
-                ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_SizingStretchProp))
+                ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_SizingStretchProp |
+                ImGuiTableFlags_Sortable))
             {
                 ImGui::TableSetupColumn("Item", ImGuiTableColumnFlags_WidthStretch, 3.0f);
-                ImGui::TableSetupColumn("Price", ImGuiTableColumnFlags_WidthFixed, 80.0f);
+                ImGui::TableSetupColumn("Price", ImGuiTableColumnFlags_WidthFixed | ImGuiTableColumnFlags_DefaultSort | ImGuiTableColumnFlags_PreferSortDescending, 80.0f);
                 ImGui::TableSetupColumn("Qty", ImGuiTableColumnFlags_WidthFixed, 40.0f);
                 ImGui::TableSetupColumn("Created", ImGuiTableColumnFlags_WidthFixed, 120.0f);
                 ImGui::TableHeadersRow();
 
+                if (ImGuiTableSortSpecs* specs = ImGui::TableGetSortSpecs()) {
+                    if (specs->SpecsDirty && specs->SpecsCount > 0) {
+                        const auto& s = specs->Specs[0];
+                        bool asc = s.SortDirection == ImGuiSortDirection_Ascending;
+                        std::sort(currentSells.begin(), currentSells.end(), [&](const FlipOut::TPTransaction& a, const FlipOut::TPTransaction& b) {
+                            int cmp = 0;
+                            switch (s.ColumnIndex) {
+                                case 0: { const auto* ai = FlipOut::TPAPI::GetItemInfo(a.item_id); const auto* bi = FlipOut::TPAPI::GetItemInfo(b.item_id);
+                                          std::string an = ai ? ai->name : ""; std::string bn = bi ? bi->name : "";
+                                          cmp = an.compare(bn); } break;
+                                case 1: cmp = a.price - b.price; break;
+                                case 2: cmp = a.quantity - b.quantity; break;
+                                case 3: cmp = a.created.compare(b.created); break;
+                            }
+                            return asc ? cmp < 0 : cmp > 0;
+                        });
+                        specs->SpecsDirty = false;
+                    }
+                }
+
                 for (const auto& tx : currentSells) {
                     ImGui::TableNextRow();
+                    ImGui::PushID((int)tx.item_id ^ 0x53454C00);
                     ImGui::TableNextColumn();
                     const auto* info = FlipOut::TPAPI::GetItemInfo(tx.item_id);
                     std::string name = info ? info->name : ("Item #" + std::to_string(tx.item_id));
                     std::string rarity = info ? info->rarity : "";
+                    ImGui::Selectable("##row", false,
+                        ImGuiSelectableFlags_SpanAllColumns | ImGuiSelectableFlags_AllowItemOverlap);
+                    if (ImGui::BeginPopupContextItem("##txs_ctx")) {
+                        bool watched = FlipOut::PriceDB::IsOnWatchlist(tx.item_id);
+                        if (watched) {
+                            if (ImGui::MenuItem("Remove from Watchlist")) {
+                                FlipOut::PriceDB::RemoveFromWatchlist(tx.item_id);
+                                FlipOut::PriceDB::SaveWatchlist();
+                            }
+                        } else {
+                            if (ImGui::MenuItem("Add to Watchlist")) {
+                                FlipOut::PriceDB::AddToWatchlist(tx.item_id);
+                                FlipOut::PriceDB::SaveWatchlist();
+                            }
+                        }
+                        if (ImGui::MenuItem("Search in Hoard & Seek")) {
+                            FlipOut::HoardBridge::SearchInHoard(name);
+                        }
+                        ImGui::EndPopup();
+                    }
+                    ImGui::SameLine(0, 0);
                     ImGui::TextColored(GetRarityColor(rarity), "%s", name.c_str());
 
                     ImGui::TableNextColumn();
@@ -1208,10 +1444,563 @@ static void RenderTransactionsTab() {
                         ImGui::Text("%s", tx.created.substr(0, 10).c_str());
                     else
                         ImGui::Text("---");
+                    ImGui::PopID();
                 }
                 ImGui::EndTable();
             }
         }
+    }
+}
+
+// --- Crafting Tab (crafting profit opportunities) ---
+
+static void RenderCraftingTab() {
+    auto recipeStatus = FlipOut::TPAPI::GetRecipeFetchStatus();
+
+    // Show recipe loading status if not loaded
+    if (recipeStatus == FlipOut::FetchStatus::Idle && FlipOut::TPAPI::GetRecipeCount() == 0) {
+        ImGui::TextColored(ImVec4(1.0f, 0.6f, 0.2f, 1.0f),
+            "Recipe data not loaded. Click 'Load Recipes' to fetch crafting data from the GW2 API.");
+        if (ImGui::Button("Load Recipes")) {
+            FlipOut::TPAPI::FetchAllRecipesAsync();
+        }
+        return;
+    }
+
+    if (recipeStatus == FlipOut::FetchStatus::InProgress) {
+        ImGui::TextColored(ImVec4(1.0f, 0.85f, 0.0f, 1.0f), "%s",
+            FlipOut::TPAPI::GetRecipeFetchMessage().c_str());
+        return;
+    }
+
+    if (recipeStatus == FlipOut::FetchStatus::Error) {
+        ImGui::TextColored(ImVec4(1.0f, 0.3f, 0.3f, 1.0f), "%s",
+            FlipOut::TPAPI::GetRecipeFetchMessage().c_str());
+        if (ImGui::Button("Retry")) {
+            FlipOut::TPAPI::FetchAllRecipesAsync();
+        }
+        return;
+    }
+
+    // Query H&S for recipe unlocks and ingredient ownership once we have crafting results
+    if (!g_CraftingProfits.empty() && FlipOut::HoardBridge::IsDataAvailable()) {
+        if (!g_CraftingRecipesQueried) {
+            std::vector<uint32_t> recipeIds;
+            recipeIds.reserve(g_CraftingProfits.size());
+            for (const auto& cp : g_CraftingProfits) {
+                if (cp.recipe_id > 0) recipeIds.push_back(cp.recipe_id);
+            }
+            if (!recipeIds.empty()) {
+                FlipOut::HoardBridge::QueryRecipeUnlocks(recipeIds);
+                g_CraftingRecipesQueried = true;
+            }
+        }
+        if (!g_CraftingIngredientsQueried) {
+            std::unordered_set<uint32_t> ingIds;
+            for (const auto& cp : g_CraftingProfits) {
+                for (const auto& [ing_id, _] : cp.ingredients) {
+                    ingIds.insert(ing_id);
+                }
+            }
+            std::vector<uint32_t> ids(ingIds.begin(), ingIds.end());
+            if (!ids.empty()) {
+                FlipOut::HoardBridge::QueryItems(ids);
+            }
+            g_CraftingIngredientsQueried = true;
+        }
+    }
+
+    bool hasUnlockData = FlipOut::HoardBridge::IsRecipeQueryDone();
+
+    // Status line with mode radio buttons
+    ImGui::Text("Recipes: %d", (int)FlipOut::TPAPI::GetRecipeCount());
+    ImGui::SameLine();
+    ImGui::Text(" | ");
+    ImGui::SameLine();
+    ImGui::Text("Results: %d", (int)g_CraftingProfits.size());
+    if (hasUnlockData) {
+        ImGui::SameLine();
+        ImGui::Text(" | ");
+        ImGui::SameLine();
+        ImGui::TextColored(ImVec4(0.4f, 0.8f, 0.4f, 1.0f), "Known: %d",
+            (int)FlipOut::HoardBridge::GetUnlockedRecipeCount());
+    } else if (g_CraftingRecipesQueried) {
+        ImGui::SameLine();
+        ImGui::Text(" | ");
+        ImGui::SameLine();
+        ImGui::TextColored(ImVec4(1.0f, 0.85f, 0.0f, 1.0f), "Checking unlocks...");
+    }
+    ImGui::SameLine();
+    ImGui::Text(" | ");
+    ImGui::SameLine();
+
+    bool filterChanged = false;
+    if (ImGui::RadioButton("Fastest", g_CraftingMode == 0)) {
+        g_CraftingMode = 0;
+        filterChanged = true;
+    }
+    ImGui::SameLine();
+    if (ImGui::RadioButton("Balanced", g_CraftingMode == 1)) {
+        g_CraftingMode = 1;
+        filterChanged = true;
+    }
+    ImGui::SameLine();
+    if (ImGui::RadioButton("Patient", g_CraftingMode == 2)) {
+        g_CraftingMode = 2;
+        filterChanged = true;
+    }
+    if (hasUnlockData) {
+        ImGui::SameLine();
+        if (ImGui::Checkbox("Known only", &g_CraftingKnownOnly)) {
+            filterChanged = true;
+        }
+    }
+
+    if (filterChanged) g_CraftingDirty = true;
+
+    if (g_CraftingDirty) {
+        g_CraftingFilter.mode = g_CraftingMode;
+        g_CraftingProfits = FlipOut::Analyzer::FindCraftingProfits(g_CraftingFilter);
+        g_CraftingRecipesQueried = false; // Re-query unlocks for new results
+        g_CraftingIngredientsQueried = false; // Re-query ingredient ownership
+        g_CraftingDirty = false;
+    }
+
+    if (g_CraftingProfits.empty()) {
+        ImGui::TextColored(ImVec4(0.6f, 0.6f, 0.6f, 1.0f),
+            "No profitable crafts found. Try lowering the filters or run a market scan first.");
+        return;
+    }
+
+    ImGui::Separator();
+
+    if (ImGui::BeginTable("##crafting", 7,
+        ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg |
+        ImGuiTableFlags_Resizable | ImGuiTableFlags_SizingStretchProp |
+        ImGuiTableFlags_ScrollY | ImGuiTableFlags_Sortable,
+        ImVec2(0, 0)))
+    {
+        ImGui::TableSetupColumn("Item", ImGuiTableColumnFlags_WidthStretch, 3.0f);
+        ImGui::TableSetupColumn("Type", ImGuiTableColumnFlags_WidthFixed, 75.0f);
+        ImGui::TableSetupColumn("Ingredients", ImGuiTableColumnFlags_WidthFixed, 90.0f);
+        ImGui::TableSetupColumn("Sell Price", ImGuiTableColumnFlags_WidthFixed, 85.0f);
+        ImGui::TableSetupColumn("Profit", ImGuiTableColumnFlags_WidthFixed | ImGuiTableColumnFlags_DefaultSort | ImGuiTableColumnFlags_PreferSortDescending, 85.0f);
+        ImGui::TableSetupColumn("ROI", ImGuiTableColumnFlags_WidthFixed, 55.0f);
+        ImGui::TableSetupColumn("Volume", ImGuiTableColumnFlags_WidthFixed, 55.0f);
+        ImGui::TableSetupScrollFreeze(0, 1);
+        ImGui::TableHeadersRow();
+
+        if (ImGuiTableSortSpecs* specs = ImGui::TableGetSortSpecs()) {
+            if (specs->SpecsDirty && specs->SpecsCount > 0) {
+                const auto& s = specs->Specs[0];
+                bool asc = s.SortDirection == ImGuiSortDirection_Ascending;
+                std::sort(g_CraftingProfits.begin(), g_CraftingProfits.end(), [&](const FlipOut::CraftingProfit& a, const FlipOut::CraftingProfit& b) {
+                    int cmp = 0;
+                    switch (s.ColumnIndex) {
+                        case 0: cmp = a.name.compare(b.name); break;
+                        case 1: cmp = a.recipe_type.compare(b.recipe_type); break;
+                        case 2: cmp = a.ingredient_cost - b.ingredient_cost; break;
+                        case 3: cmp = a.sell_price - b.sell_price; break;
+                        case 4: cmp = a.profit - b.profit; break;
+                        case 5: cmp = (a.roi > b.roi) - (a.roi < b.roi); break;
+                        case 6: cmp = a.sell_quantity - b.sell_quantity; break;
+                    }
+                    return asc ? cmp < 0 : cmp > 0;
+                });
+                specs->SpecsDirty = false;
+            }
+        }
+
+        for (const auto& cp : g_CraftingProfits) {
+            // Filter by known recipes if checkbox enabled
+            if (g_CraftingKnownOnly && hasUnlockData && cp.recipe_id > 0) {
+                if (!FlipOut::HoardBridge::IsRecipeUnlocked(cp.recipe_id)) continue;
+            }
+
+            ImGui::TableNextRow(0, ICON_SIZE + 4);
+            ImGui::PushID((int)cp.item_id);
+
+            // Invisible selectable spanning all columns for row right-click
+            ImGui::TableNextColumn();
+            ImGui::Selectable("##row", false,
+                ImGuiSelectableFlags_SpanAllColumns | ImGuiSelectableFlags_AllowItemOverlap,
+                ImVec2(0, ICON_SIZE));
+            if (ImGui::BeginPopupContextItem("##craft_ctx")) {
+                bool watched = FlipOut::PriceDB::IsOnWatchlist(cp.item_id);
+                if (watched) {
+                    if (ImGui::MenuItem("Remove from Watchlist")) {
+                        FlipOut::PriceDB::RemoveFromWatchlist(cp.item_id);
+                        FlipOut::PriceDB::SaveWatchlist();
+                    }
+                } else {
+                    if (ImGui::MenuItem("Add to Watchlist")) {
+                        FlipOut::PriceDB::AddToWatchlist(cp.item_id);
+                        FlipOut::PriceDB::SaveWatchlist();
+                    }
+                }
+                if (ImGui::MenuItem("Search in Hoard & Seek")) {
+                    FlipOut::HoardBridge::SearchInHoard(cp.name);
+                }
+                ImGui::Separator();
+                if (ImGui::MenuItem("View Price History")) {
+                    OpenPriceHistory(cp.item_id, cp.name, cp.rarity);
+                }
+                ImGui::EndPopup();
+            }
+            ImGui::SameLine(0, 0);
+
+            // Item name + icon
+            const auto* info = FlipOut::TPAPI::GetItemInfo(cp.item_id);
+            std::string iconUrl = info ? info->icon_url : "";
+            RenderItemIcon(cp.item_id, iconUrl, cp.rarity);
+            ImGui::SameLine();
+
+            // Show unlock indicator if H&S data available
+            if (hasUnlockData && cp.recipe_id > 0) {
+                if (FlipOut::HoardBridge::IsRecipeUnlocked(cp.recipe_id)) {
+                    ImGui::TextColored(ImVec4(0.4f, 0.85f, 0.4f, 1.0f), "*");
+                    if (ImGui::IsItemHovered()) {
+                        ImGui::BeginTooltip();
+                        ImGui::Text("Recipe known");
+                        ImGui::EndTooltip();
+                    }
+                } else {
+                    ImGui::TextColored(ImVec4(0.5f, 0.5f, 0.5f, 1.0f), "?");
+                    if (ImGui::IsItemHovered()) {
+                        ImGui::BeginTooltip();
+                        ImGui::Text("Recipe not unlocked");
+                        ImGui::EndTooltip();
+                    }
+                }
+                ImGui::SameLine();
+            }
+
+            ImGui::TextColored(GetRarityColor(cp.rarity), "%s", cp.name.c_str());
+            if (cp.output_count > 1) {
+                ImGui::SameLine();
+                ImGui::TextColored(ImVec4(0.6f, 0.6f, 0.6f, 1.0f), " x%d", cp.output_count);
+            }
+
+            // Tooltip with ingredient details + owned counts
+            if (ImGui::IsItemHovered()) {
+                ImGui::BeginTooltip();
+                ImGui::Text("Ingredients:");
+                bool hsAvail = FlipOut::HoardBridge::IsDataAvailable();
+                int owned_savings = 0;
+                auto all_prices = FlipOut::TPAPI::GetAllPrices();
+                for (const auto& [ing_id, ing_count] : cp.ingredients) {
+                    const auto* ing_info = FlipOut::TPAPI::GetItemInfo(ing_id);
+                    std::string ing_name = ing_info ? ing_info->name : ("Item #" + std::to_string(ing_id));
+                    if (hsAvail) {
+                        const auto* owned = FlipOut::HoardBridge::GetOwnedItem(ing_id);
+                        int have = owned ? owned->total_count : 0;
+                        if (have >= ing_count) {
+                            ImGui::TextColored(ImVec4(0.35f, 0.82f, 0.35f, 1.0f),
+                                "  %dx %s [%d owned]", ing_count, ing_name.c_str(), have);
+                            auto pit = all_prices.find(ing_id);
+                            int ing_unit = pit != all_prices.end() ? (g_CraftingMode == 2 ? pit->second.buy_price : pit->second.sell_price) : 0;
+                            owned_savings += ing_unit * ing_count;
+                        } else if (have > 0) {
+                            ImGui::TextColored(ImVec4(1.0f, 0.85f, 0.0f, 1.0f),
+                                "  %dx %s [%d/%d owned]", ing_count, ing_name.c_str(), have, ing_count);
+                            auto pit = all_prices.find(ing_id);
+                            int ing_unit = pit != all_prices.end() ? (g_CraftingMode == 2 ? pit->second.buy_price : pit->second.sell_price) : 0;
+                            owned_savings += ing_unit * have;
+                        } else {
+                            ImGui::Text("  %dx %s", ing_count, ing_name.c_str());
+                        }
+                    } else {
+                        ImGui::Text("  %dx %s", ing_count, ing_name.c_str());
+                    }
+                }
+                ImGui::Separator();
+                ImGui::Text("Cost: %s", FlipOut::Analyzer::FormatCoins(cp.ingredient_cost).c_str());
+                if (hsAvail && owned_savings > 0) {
+                    int adjusted = cp.ingredient_cost - owned_savings;
+                    if (adjusted < 0) adjusted = 0;
+                    ImGui::TextColored(ImVec4(0.35f, 0.82f, 0.35f, 1.0f),
+                        "Cost (with owned): %s", FlipOut::Analyzer::FormatCoins(adjusted).c_str());
+                    int adjusted_profit = cp.sell_revenue - adjusted;
+                    ImGui::TextColored(ImVec4(0.35f, 0.82f, 0.35f, 1.0f),
+                        "Adjusted profit: %s", FlipOut::Analyzer::FormatCoins(adjusted_profit).c_str());
+                }
+                ImGui::Text("Revenue: %s (after tax)", FlipOut::Analyzer::FormatCoins(cp.sell_revenue).c_str());
+                ImGui::EndTooltip();
+            }
+
+            // Recipe type
+            ImGui::TableNextColumn();
+            ImGui::Text("%s", cp.recipe_type.c_str());
+
+            // Ingredient cost
+            ImGui::TableNextColumn();
+            RenderCoins(cp.ingredient_cost);
+
+            // Sell price
+            ImGui::TableNextColumn();
+            RenderCoins(cp.sell_price);
+
+            // Profit
+            ImGui::TableNextColumn();
+            RenderCoins(cp.profit);
+
+            // ROI
+            ImGui::TableNextColumn();
+            ImGui::Text("%.1f%%", cp.roi);
+
+            // Volume
+            ImGui::TableNextColumn();
+            ImGui::Text("%d", cp.sell_quantity);
+
+            ImGui::PopID();
+        }
+
+        ImGui::EndTable();
+    }
+}
+
+// --- Liquidate Tab (sell owned items for fast gold) ---
+
+static void BuildLiquidateList() {
+    auto owned = FlipOut::HoardBridge::GetAllOwnedItems();
+    auto prices = FlipOut::TPAPI::GetAllPrices();
+    std::vector<LiquidateEntry> items;
+    items.reserve(owned.size());
+
+    for (const auto& [id, oi] : owned) {
+        if (oi.total_count <= 0) continue;
+        auto pit = prices.find(id);
+        if (pit == prices.end()) continue;
+        int bp = pit->second.buy_price;
+        int sp = pit->second.sell_price;
+        if (bp <= 0 && sp <= 0) continue;
+
+        // Subtract counts from non-sellable locations
+        int unsellable = 0;
+        for (const auto& [loc, cnt] : oi.locations) {
+            // Legendary Armory, equipped gear, and shared inventory slots are not sellable
+            if (loc.find("Legendary Armory") != std::string::npos ||
+                loc.find("Equipped") != std::string::npos ||
+                loc.find("equipped") != std::string::npos) {
+                unsellable += cnt;
+            }
+        }
+        int sellable = oi.total_count - unsellable;
+        if (sellable <= 0) continue;
+
+        LiquidateEntry e;
+        e.item_id = id;
+        e.count = sellable;
+        e.buy_price = bp;
+        e.sell_price = sp;
+        e.total_instant = (int)((double)sellable * bp * 0.85);
+        e.total_listed = (int)((double)sellable * sp * 0.85);
+
+        const auto* info = FlipOut::TPAPI::GetItemInfo(id);
+        e.name = info ? info->name : oi.name;
+        e.rarity = info ? info->rarity : oi.rarity;
+        e.icon_url = info ? info->icon_url : "";
+        items.push_back(std::move(e));
+    }
+
+    // Sort by total instant value descending
+    std::stable_sort(items.begin(), items.end(),
+        [](const LiquidateEntry& a, const LiquidateEntry& b) {
+            return a.total_instant > b.total_instant;
+        });
+
+    // Keep top 50 results
+    if (items.size() > 50) items.resize(50);
+
+    g_LiquidateItems = std::move(items);
+    g_LiquidateLoaded = true;
+    g_LiquidateLoading = false;
+}
+
+static void FetchLiquidateData() {
+    g_LiquidateLoading = true;
+    g_LiquidateLoaded = false;
+
+    // Query all tradeable item IDs via H&S (uses its local account cache)
+    auto prices = FlipOut::TPAPI::GetAllPrices();
+    std::vector<uint32_t> ids;
+    ids.reserve(prices.size());
+    for (const auto& [id, _] : prices) ids.push_back(id);
+    FlipOut::HoardBridge::QueryItems(ids);
+
+    // Record start time; we'll build the list after a short delay to let H&S respond
+    g_LiquidateScanStart = std::chrono::steady_clock::now();
+}
+
+static void RenderLiquidateTab() {
+    bool hsAvail = FlipOut::HoardBridge::IsDataAvailable();
+
+    if (!hsAvail) {
+        ImGui::TextColored(ImVec4(1.0f, 0.7f, 0.2f, 1.0f),
+            "Hoard & Seek is not connected. This tab requires H&S for account data.");
+        return;
+    }
+
+    bool hasPrices = FlipOut::TPAPI::HasPrices();
+    if (!hasPrices) {
+        ImGui::TextColored(ImVec4(0.6f, 0.6f, 0.6f, 1.0f),
+            "No price data. Run 'Scan Market' on the Flips tab first.");
+        return;
+    }
+
+    // Scan button
+    if (g_LiquidateLoading) {
+        auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - g_LiquidateScanStart).count();
+        if (elapsed >= 2000) {
+            // H&S has had enough time to respond from local cache
+            BuildLiquidateList();
+        } else {
+            ImGui::TextColored(ImVec4(1.0f, 0.85f, 0.0f, 1.0f), "Querying inventory...");
+        }
+    } else {
+        if (ImGui::Button("Get Owned Items")) {
+            FetchLiquidateData();
+        }
+        if (g_LiquidateLoaded) {
+            ImGui::SameLine();
+            ImGui::TextColored(ImVec4(0.5f, 0.5f, 0.5f, 1.0f),
+                "%d tradeable items", (int)g_LiquidateItems.size());
+        }
+    }
+
+    if (!g_LiquidateLoaded || g_LiquidateItems.empty()) {
+        if (g_LiquidateLoaded) {
+            ImGui::TextColored(ImVec4(0.6f, 0.6f, 0.6f, 1.0f),
+                "No tradeable items found in your inventory.");
+        }
+        return;
+    }
+
+    // Grand total
+    long long grand_instant = 0, grand_listed = 0;
+    for (const auto& e : g_LiquidateItems) {
+        grand_instant += e.total_instant;
+        grand_listed += e.total_listed;
+    }
+    ImGui::Text("Total (instant sell): ");
+    ImGui::SameLine(0, 0);
+    RenderCoins((int)std::min(grand_instant, (long long)INT_MAX));
+    ImGui::SameLine();
+    ImGui::Text("  Total (listed): ");
+    ImGui::SameLine(0, 0);
+    RenderCoins((int)std::min(grand_listed, (long long)INT_MAX));
+
+    ImGui::Separator();
+
+    // Table
+    if (ImGui::BeginTable("##liquidate", 7,
+        ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY |
+        ImGuiTableFlags_Resizable | ImGuiTableFlags_SizingStretchProp | ImGuiTableFlags_Sortable,
+        ImVec2(0, ImGui::GetContentRegionAvail().y - 4)))
+    {
+        ImGui::TableSetupColumn("Item", ImGuiTableColumnFlags_WidthStretch, 3.0f);
+        ImGui::TableSetupColumn("Qty", ImGuiTableColumnFlags_WidthFixed | ImGuiTableColumnFlags_DefaultSort | ImGuiTableColumnFlags_PreferSortDescending, 45.0f);
+        ImGui::TableSetupColumn("Instant Price", ImGuiTableColumnFlags_WidthFixed, 85.0f);
+        ImGui::TableSetupColumn("List Price", ImGuiTableColumnFlags_WidthFixed, 85.0f);
+        ImGui::TableSetupColumn("Instant Total", ImGuiTableColumnFlags_WidthFixed | ImGuiTableColumnFlags_DefaultSort | ImGuiTableColumnFlags_PreferSortDescending, 95.0f, 4);
+        ImGui::TableSetupColumn("Listed Total", ImGuiTableColumnFlags_WidthFixed, 95.0f);
+        ImGui::TableSetupColumn("Rarity", ImGuiTableColumnFlags_WidthFixed, 65.0f);
+        ImGui::TableSetupScrollFreeze(0, 1);
+        ImGui::TableHeadersRow();
+
+        // Sort
+        if (ImGuiTableSortSpecs* specs = ImGui::TableGetSortSpecs()) {
+            if (specs->SpecsDirty && specs->SpecsCount > 0) {
+                const auto& s = specs->Specs[0];
+                bool asc = (s.SortDirection == ImGuiSortDirection_Ascending);
+                int col = s.ColumnIndex;
+                std::stable_sort(g_LiquidateItems.begin(), g_LiquidateItems.end(),
+                    [col, asc](const LiquidateEntry& a, const LiquidateEntry& b) {
+                        int cmp = 0;
+                        switch (col) {
+                            case 0: cmp = a.name.compare(b.name); break;
+                            case 1: cmp = a.count - b.count; break;
+                            case 2: cmp = a.buy_price - b.buy_price; break;
+                            case 3: cmp = a.sell_price - b.sell_price; break;
+                            case 4: cmp = a.total_instant - b.total_instant; break;
+                            case 5: cmp = a.total_listed - b.total_listed; break;
+                            case 6: cmp = a.rarity.compare(b.rarity); break;
+                        }
+                        return asc ? cmp < 0 : cmp > 0;
+                    });
+                specs->SpecsDirty = false;
+            }
+        }
+
+        for (const auto& e : g_LiquidateItems) {
+            ImGui::TableNextRow(0, ICON_SIZE + 4);
+            ImGui::PushID((int)e.item_id);
+
+            // Item
+            ImGui::TableNextColumn();
+            ImGui::Selectable("##row", false,
+                ImGuiSelectableFlags_SpanAllColumns | ImGuiSelectableFlags_AllowItemOverlap,
+                ImVec2(0, ICON_SIZE));
+            if (ImGui::BeginPopupContextItem("##liq_ctx")) {
+                bool watched = FlipOut::PriceDB::IsOnWatchlist(e.item_id);
+                if (watched) {
+                    if (ImGui::MenuItem("Remove from Watchlist")) {
+                        FlipOut::PriceDB::RemoveFromWatchlist(e.item_id);
+                        FlipOut::PriceDB::SaveWatchlist();
+                    }
+                } else {
+                    if (ImGui::MenuItem("Add to Watchlist")) {
+                        FlipOut::PriceDB::AddToWatchlist(e.item_id);
+                        FlipOut::PriceDB::SaveWatchlist();
+                    }
+                }
+                if (ImGui::MenuItem("Search in Hoard & Seek")) {
+                    FlipOut::HoardBridge::SearchInHoard(e.name);
+                }
+                ImGui::Separator();
+                if (ImGui::MenuItem("View Price History")) {
+                    OpenPriceHistory(e.item_id, e.name, e.rarity);
+                }
+                ImGui::EndPopup();
+            }
+            ImGui::SameLine(0, 0);
+            RenderItemIcon(e.item_id, e.icon_url, e.rarity);
+            ImGui::SameLine();
+            ImGui::TextColored(GetRarityColor(e.rarity), "%s", e.name.c_str());
+
+            // Qty
+            ImGui::TableNextColumn();
+            ImGui::Text("%d", e.count);
+
+            // Instant price (buy order)
+            ImGui::TableNextColumn();
+            if (e.buy_price > 0) RenderCoins(e.buy_price);
+            else ImGui::TextColored(ImVec4(0.5f, 0.5f, 0.5f, 1.0f), "---");
+
+            // List price (sell listing)
+            ImGui::TableNextColumn();
+            if (e.sell_price > 0) RenderCoins(e.sell_price);
+            else ImGui::TextColored(ImVec4(0.5f, 0.5f, 0.5f, 1.0f), "---");
+
+            // Instant total
+            ImGui::TableNextColumn();
+            if (e.total_instant > 0) RenderCoins(e.total_instant);
+            else ImGui::TextColored(ImVec4(0.5f, 0.5f, 0.5f, 1.0f), "---");
+
+            // Listed total (after tax)
+            ImGui::TableNextColumn();
+            if (e.total_listed > 0) RenderCoins(e.total_listed);
+            else ImGui::TextColored(ImVec4(0.5f, 0.5f, 0.5f, 1.0f), "---");
+
+            // Rarity
+            ImGui::TableNextColumn();
+            ImGui::TextColored(GetRarityColor(e.rarity), "%s", e.rarity.c_str());
+
+            ImGui::PopID();
+        }
+
+        ImGui::EndTable();
     }
 }
 
@@ -1255,7 +2044,7 @@ static void RenderSearchTab() {
     int col_count = hsConnected ? 6 : 5;
     if (ImGui::BeginTable("##search_results", col_count,
         ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY |
-        ImGuiTableFlags_Resizable | ImGuiTableFlags_SizingStretchProp,
+        ImGuiTableFlags_Resizable | ImGuiTableFlags_SizingStretchProp | ImGuiTableFlags_Sortable,
         ImVec2(0, ImGui::GetContentRegionAvail().y - 4)))
     {
         ImGui::TableSetupColumn("Item", ImGuiTableColumnFlags_WidthStretch, 3.0f);
@@ -1268,6 +2057,39 @@ static void RenderSearchTab() {
         }
         ImGui::TableSetupScrollFreeze(0, 1);
         ImGui::TableHeadersRow();
+
+        if (ImGuiTableSortSpecs* specs = ImGui::TableGetSortSpecs()) {
+            if (specs->SpecsDirty && specs->SpecsCount > 0) {
+                const auto& s = specs->Specs[0];
+                bool asc = s.SortDirection == ImGuiSortDirection_Ascending;
+                std::sort(g_SearchResults.begin(), g_SearchResults.end(), [&](const FlipOut::ItemInfo& a, const FlipOut::ItemInfo& b) {
+                    auto pa = prices.find(a.id);
+                    auto pb = prices.find(b.id);
+                    int ab = pa != prices.end() ? pa->second.buy_price : 0;
+                    int as_ = pa != prices.end() ? pa->second.sell_price : 0;
+                    int bb_ = pb != prices.end() ? pb->second.buy_price : 0;
+                    int bs = pb != prices.end() ? pb->second.sell_price : 0;
+                    int cmp = 0;
+                    switch (s.ColumnIndex) {
+                        case 0: cmp = a.name.compare(b.name); break;
+                        case 1: cmp = ab - bb_; break;
+                        case 2: cmp = as_ - bs; break;
+                        case 3: { int ap = (ab > 0 && as_ > 0) ? FlipOut::Analyzer::CalcProfit(ab, as_) : 0;
+                                  int bp = (bb_ > 0 && bs > 0) ? FlipOut::Analyzer::CalcProfit(bb_, bs) : 0;
+                                  cmp = ap - bp; } break;
+                        case 4: { float am = (ab > 0 && as_ > 0) ? FlipOut::Analyzer::CalcMargin(ab, as_) : 0;
+                                  float bm = (bb_ > 0 && bs > 0) ? FlipOut::Analyzer::CalcMargin(bb_, bs) : 0;
+                                  cmp = (am > bm) - (am < bm); } break;
+                        case 5: { const auto* ao = FlipOut::HoardBridge::GetOwnedItem(a.id);
+                                  const auto* bo = FlipOut::HoardBridge::GetOwnedItem(b.id);
+                                  int ac = ao ? ao->total_count : 0; int bc = bo ? bo->total_count : 0;
+                                  cmp = ac - bc; } break;
+                    }
+                    return asc ? cmp < 0 : cmp > 0;
+                });
+                specs->SpecsDirty = false;
+            }
+        }
 
         for (const auto& item : g_SearchResults) {
             ImGui::TableNextRow(0, ICON_SIZE + 4);
@@ -1319,8 +2141,7 @@ static void RenderSearchTab() {
             ImGui::TableNextColumn();
             if (buy > 0 && sell > 0) {
                 int profit = FlipOut::Analyzer::CalcProfit(buy, sell);
-                ImVec4 col = profit > 0 ? ImVec4(0.35f, 0.82f, 0.35f, 1.0f) : ImVec4(1.0f, 0.3f, 0.3f, 1.0f);
-                ImGui::TextColored(col, "%s", FlipOut::Analyzer::FormatCoinsShort(profit).c_str());
+                RenderCoins(profit);
             } else {
                 ImGui::Text("---");
             }
@@ -1371,6 +2192,7 @@ void AddonLoad(AddonAPI_t* aApi) {
 
     // Load saved data
     FlipOut::TPAPI::LoadItemCache();
+    FlipOut::TPAPI::LoadRecipeCache();
     FlipOut::PriceDB::Load();
     FlipOut::PriceDB::LoadWatchlist();
 
@@ -1510,24 +2332,34 @@ void AddonRender() {
     }
 
     // Tab bar
-    if (ImGui::BeginTabBar("##tabs")) {
+    if (ImGui::BeginTabBar("##maintabs")) {
         if (ImGui::BeginTabItem("Flips")) {
             g_ActiveTab = 0;
             RenderFlipsTab();
             ImGui::EndTabItem();
         }
-        if (ImGui::BeginTabItem("Watchlist")) {
+        if (ImGui::BeginTabItem("Crafting")) {
             g_ActiveTab = 1;
+            RenderCraftingTab();
+            ImGui::EndTabItem();
+        }
+        if (ImGui::BeginTabItem("Liquidate")) {
+            g_ActiveTab = 2;
+            RenderLiquidateTab();
+            ImGui::EndTabItem();
+        }
+        if (ImGui::BeginTabItem("Watchlist")) {
+            g_ActiveTab = 3;
             RenderWatchlistTab();
             ImGui::EndTabItem();
         }
         if (ImGui::BeginTabItem("Transactions")) {
-            g_ActiveTab = 2;
+            g_ActiveTab = 4;
             RenderTransactionsTab();
             ImGui::EndTabItem();
         }
         if (ImGui::BeginTabItem("Search")) {
-            g_ActiveTab = 3;
+            g_ActiveTab = 5;
             RenderSearchTab();
             ImGui::EndTabItem();
         }
@@ -1544,6 +2376,13 @@ void AddonRender() {
 
 void AddonOptions() {
     ImGui::Text("Flip Out Settings");
+    if (ImGui::SmallButton("Homepage")) {
+        ShellExecuteA(NULL, "open", "https://pie.rocks.cc/", NULL, NULL, SW_SHOWNORMAL);
+    }
+    ImGui::SameLine();
+    if (ImGui::SmallButton("Buy me a coffee!")) {
+        ShellExecuteA(NULL, "open", "https://ko-fi.com/pieorcake", NULL, NULL, SW_SHOWNORMAL);
+    }
     ImGui::Separator();
 
     // Hoard & Seek connection status
@@ -1590,6 +2429,17 @@ void AddonOptions() {
 
     ImGui::Spacing();
     ImGui::Separator();
+    ImGui::Text("Quick Access:");
+    if (ImGui::Checkbox("Show icon in Quick Access bar", &g_ShowQAIcon)) {
+        if (g_ShowQAIcon) {
+            APIDefs->QuickAccess_Add(QA_ID, TEX_ICON, TEX_ICON_HOVER, "KB_FLIPOUT_TOGGLE", "Flip Out");
+        } else {
+            APIDefs->QuickAccess_Remove(QA_ID);
+        }
+    }
+
+    ImGui::Spacing();
+    ImGui::Separator();
     ImGui::Text("Data Management:");
     if (ImGui::Button("Save All Data")) {
         FlipOut::PriceDB::Save();
@@ -1615,7 +2465,7 @@ extern "C" __declspec(dllexport) AddonDefinition_t* GetAddonDef() {
     AddonDef.Version.Minor = V_MINOR;
     AddonDef.Version.Build = V_BUILD;
     AddonDef.Version.Revision = V_REVISION;
-    AddonDef.Author = "FlipOut";
+    AddonDef.Author = "PieOrCake.7635";
     AddonDef.Description = "Trading Post market tracker - find flips, track trends, make gold";
     AddonDef.Load = AddonLoad;
     AddonDef.Unload = AddonUnload;

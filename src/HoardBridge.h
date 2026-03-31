@@ -14,6 +14,21 @@
 
 namespace FlipOut {
 
+    // Retry queue entry for H&S queries that returned PENDING
+    enum class RetryType {
+        ItemQuery,
+        RecipeUnlock,
+        TransactionBuys,
+        TransactionSells
+    };
+
+    struct PendingRetry {
+        RetryType type;
+        std::vector<uint32_t> ids;  // item IDs or recipe IDs (empty for TX)
+        int attempts = 0;
+        std::chrono::steady_clock::time_point retry_at;
+    };
+
     // Connection status with Hoard & Seek
     enum class HoardStatus {
         Unknown,        // Haven't pinged yet
@@ -85,6 +100,13 @@ namespace FlipOut {
         static std::unordered_map<uint32_t, OwnedItem> GetAllOwnedItems();
         static size_t GetOwnedItemCount();
 
+        // Recipe unlock queries (via H&S EV_HOARD_QUERY_RECIPES)
+        static void QueryRecipeUnlocks(const std::vector<uint32_t>& recipe_ids);
+        static bool IsRecipeUnlocked(uint32_t recipe_id);
+        static bool IsRecipeQueried(uint32_t recipe_id);
+        static size_t GetUnlockedRecipeCount();
+        static bool IsRecipeQueryDone();
+
         // Transaction data (fetched via H&S API proxy)
         static const std::vector<TPTransaction>& GetCurrentBuys();
         static const std::vector<TPTransaction>& GetCurrentSells();
@@ -104,6 +126,7 @@ namespace FlipOut {
         static void OnApiQueryResponse(void* eventArgs);
         static void OnTxBuysResponse(void* eventArgs);
         static void OnTxSellsResponse(void* eventArgs);
+        static void OnRecipeQueryResponse(void* eventArgs);
 
         // Context menu callback (MUST delete payload)
         static void OnContextMenuWatch(void* eventArgs);
@@ -129,13 +152,27 @@ namespace FlipOut {
         // Permission state
         static bool s_permissionPending;
         static bool s_permissionDenied;
-        static std::chrono::steady_clock::time_point s_permissionRetryTime;
+
+        // Retry queue
+        static std::vector<PendingRetry> s_retryQueue;
+        static std::unordered_map<int, int> s_retryAttempts; // RetryType(int) -> attempt count
+        static const int RETRY_MAX = 3;
+        static const int RETRY_DELAY_MS = 2000;
+        static void ScheduleRetry(RetryType type, const std::vector<uint32_t>& ids);
+        static void ProcessRetries();
+        static void ResetRetryCount(RetryType type);
 
         // Query deduplication
         static std::unordered_set<uint32_t> s_queriedItems;
 
         // Owned items cache
         static std::unordered_map<uint32_t, OwnedItem> s_ownedItems;
+
+        // Recipe unlock data
+        static std::unordered_set<uint32_t> s_unlockedRecipes;
+        static std::unordered_set<uint32_t> s_queriedRecipes;
+        static bool s_recipeQueryDone;
+        static int s_recipeBatchesPending;
 
         // Transaction data
         static std::vector<TPTransaction> s_currentBuys;

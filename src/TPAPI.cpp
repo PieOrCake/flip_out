@@ -21,6 +21,9 @@ namespace FlipOut {
     std::atomic<bool> TPAPI::s_scan_cancelled{false};
     std::unordered_map<uint32_t, TPPrice> TPAPI::s_prices;
     std::unordered_map<uint32_t, ItemInfo> TPAPI::s_item_cache;
+    std::unordered_map<uint32_t, Recipe> TPAPI::s_recipes;
+    FetchStatus TPAPI::s_recipe_fetch_status = FetchStatus::Idle;
+    std::string TPAPI::s_recipe_fetch_message;
     std::mutex TPAPI::s_mutex;
 
     // --- Helpers ---
@@ -472,6 +475,11 @@ namespace FlipOut {
         return s_prices;
     }
 
+    bool TPAPI::HasPrices() {
+        std::lock_guard<std::mutex> lock(s_mutex);
+        return !s_prices.empty();
+    }
+
     void TPAPI::UpdatePrices(const std::unordered_map<uint32_t, TPPrice>& prices) {
         std::lock_guard<std::mutex> lock(s_mutex);
         for (const auto& [id, p] : prices) {
@@ -531,6 +539,297 @@ namespace FlipOut {
                     s_item_cache[id] = info;
                 }
             }
+            return true;
+        } catch (...) {
+            return false;
+        }
+    }
+
+    // --- Recipe API ---
+
+    std::vector<uint32_t> TPAPI::FetchAllRecipeIds() {
+        std::vector<uint32_t> ids;
+        std::string url = "https://api.guildwars2.com/v2/recipes";
+        std::string response = HttpClient::Get(url);
+        if (response.empty()) return ids;
+
+        try {
+            json j = json::parse(response);
+            if (j.is_array()) {
+                ids.reserve(j.size());
+                for (const auto& id : j) {
+                    ids.push_back(id.get<uint32_t>());
+                }
+            }
+        } catch (...) {}
+        return ids;
+    }
+
+    std::vector<Recipe> TPAPI::FetchRecipes(const std::vector<uint32_t>& recipe_ids) {
+        std::vector<Recipe> results;
+        if (recipe_ids.empty()) return results;
+
+        const size_t BATCH_SIZE = 200;
+        for (size_t i = 0; i < recipe_ids.size(); i += BATCH_SIZE) {
+            std::string ids_param;
+            size_t end = std::min(i + BATCH_SIZE, recipe_ids.size());
+            for (size_t j = i; j < end; j++) {
+                if (!ids_param.empty()) ids_param += ",";
+                ids_param += std::to_string(recipe_ids[j]);
+            }
+
+            std::string url = "https://api.guildwars2.com/v2/recipes?ids=" + ids_param;
+            std::string response = HttpClient::Get(url);
+            if (response.empty()) continue;
+
+            try {
+                json j = json::parse(response);
+                if (j.is_array()) {
+                    for (const auto& item : j) {
+                        Recipe r;
+                        r.id = item.value("id", (uint32_t)0);
+                        r.output_item_id = item.value("output_item_id", (uint32_t)0);
+                        r.output_item_count = item.value("output_item_count", 1);
+                        r.type = item.value("type", "");
+                        r.min_rating = item.value("min_rating", 0);
+
+                        if (item.contains("disciplines") && item["disciplines"].is_array()) {
+                            for (const auto& d : item["disciplines"]) {
+                                r.disciplines.push_back(d.get<std::string>());
+                            }
+                        }
+
+                        if (item.contains("ingredients") && item["ingredients"].is_array()) {
+                            for (const auto& ing : item["ingredients"]) {
+                                RecipeIngredient ri;
+                                ri.item_id = ing.value("item_id", (uint32_t)0);
+                                ri.count = ing.value("count", 0);
+                                r.ingredients.push_back(ri);
+                            }
+                        }
+
+                        if (item.contains("flags") && item["flags"].is_array()) {
+                            for (const auto& f : item["flags"]) {
+                                if (f.get<std::string>() == "AutoLearned") {
+                                    r.auto_learned = true;
+                                    break;
+                                }
+                            }
+                        }
+
+                        results.push_back(r);
+                    }
+                }
+            } catch (...) {}
+        }
+        return results;
+    }
+
+    void TPAPI::FetchAllRecipesAsync() {
+        {
+            std::lock_guard<std::mutex> lock(s_mutex);
+            if (s_recipe_fetch_status == FetchStatus::InProgress) return;
+            s_recipe_fetch_status = FetchStatus::InProgress;
+            s_recipe_fetch_message = "Fetching recipe list...";
+        }
+
+        std::thread([]() {
+            try {
+                auto ids = FetchAllRecipeIds();
+                if (ids.empty()) {
+                    std::lock_guard<std::mutex> lock(s_mutex);
+                    s_recipe_fetch_status = FetchStatus::Error;
+                    s_recipe_fetch_message = "Failed to fetch recipe list";
+                    return;
+                }
+
+                {
+                    std::lock_guard<std::mutex> lock(s_mutex);
+                    s_recipe_fetch_message = "Fetching " + std::to_string(ids.size()) + " recipes...";
+                }
+
+                const size_t BATCH = 200;
+                std::unordered_map<uint32_t, Recipe> all_recipes;
+                size_t total = ids.size();
+
+                for (size_t i = 0; i < total; i += BATCH) {
+                    if (s_scan_cancelled.load()) {
+                        std::lock_guard<std::mutex> lock(s_mutex);
+                        s_recipe_fetch_status = FetchStatus::Idle;
+                        s_recipe_fetch_message = "Recipe fetch cancelled";
+                        return;
+                    }
+
+                    std::string ids_param;
+                    size_t end = std::min(i + BATCH, total);
+                    for (size_t j = i; j < end; j++) {
+                        if (!ids_param.empty()) ids_param += ",";
+                        ids_param += std::to_string(ids[j]);
+                    }
+
+                    std::string url = "https://api.guildwars2.com/v2/recipes?ids=" + ids_param;
+                    std::string response = HttpClient::Get(url);
+                    if (!response.empty()) {
+                        try {
+                            json j = json::parse(response);
+                            if (j.is_array()) {
+                                for (const auto& item : j) {
+                                    Recipe r;
+                                    r.id = item.value("id", (uint32_t)0);
+                                    r.output_item_id = item.value("output_item_id", (uint32_t)0);
+                                    r.output_item_count = item.value("output_item_count", 1);
+                                    r.type = item.value("type", "");
+                                    r.min_rating = item.value("min_rating", 0);
+
+                                    if (item.contains("disciplines") && item["disciplines"].is_array()) {
+                                        for (const auto& d : item["disciplines"])
+                                            r.disciplines.push_back(d.get<std::string>());
+                                    }
+                                    if (item.contains("ingredients") && item["ingredients"].is_array()) {
+                                        for (const auto& ing : item["ingredients"]) {
+                                            RecipeIngredient ri;
+                                            ri.item_id = ing.value("item_id", (uint32_t)0);
+                                            ri.count = ing.value("count", 0);
+                                            r.ingredients.push_back(ri);
+                                        }
+                                    }
+                                    if (item.contains("flags") && item["flags"].is_array()) {
+                                        for (const auto& f : item["flags"]) {
+                                            if (f.get<std::string>() == "AutoLearned") {
+                                                r.auto_learned = true;
+                                                break;
+                                            }
+                                        }
+                                    }
+
+                                    // Store by output item ID (keep highest-rating recipe if multiple)
+                                    auto existing = all_recipes.find(r.output_item_id);
+                                    if (existing == all_recipes.end() || r.min_rating > existing->second.min_rating) {
+                                        all_recipes[r.output_item_id] = r;
+                                    }
+                                }
+                            }
+                        } catch (...) {}
+                    }
+
+                    float progress = (float)end / (float)total;
+                    {
+                        std::lock_guard<std::mutex> lock(s_mutex);
+                        s_recipe_fetch_message = "Fetching recipes... " +
+                            std::to_string((int)(progress * 100)) + "% (" +
+                            std::to_string(all_recipes.size()) + " recipes)";
+                    }
+
+                    std::this_thread::sleep_for(std::chrono::milliseconds(THROTTLE_MS));
+                }
+
+                {
+                    std::lock_guard<std::mutex> lock(s_mutex);
+                    s_recipes = all_recipes;
+                    s_recipe_fetch_status = FetchStatus::Success;
+                    s_recipe_fetch_message = "Recipes loaded (" + std::to_string(all_recipes.size()) + ")";
+                }
+
+                SaveRecipeCache();
+
+            } catch (...) {
+                std::lock_guard<std::mutex> lock(s_mutex);
+                s_recipe_fetch_status = FetchStatus::Error;
+                s_recipe_fetch_message = "Error fetching recipes";
+            }
+        }).detach();
+    }
+
+    FetchStatus TPAPI::GetRecipeFetchStatus() {
+        std::lock_guard<std::mutex> lock(s_mutex);
+        return s_recipe_fetch_status;
+    }
+
+    const std::string& TPAPI::GetRecipeFetchMessage() {
+        return s_recipe_fetch_message;
+    }
+
+    const std::unordered_map<uint32_t, Recipe>& TPAPI::GetRecipesByOutput() {
+        return s_recipes;
+    }
+
+    size_t TPAPI::GetRecipeCount() {
+        std::lock_guard<std::mutex> lock(s_mutex);
+        return s_recipes.size();
+    }
+
+    bool TPAPI::SaveRecipeCache() {
+        EnsureDataDirectory();
+        std::string path = GetDataDirectory() + "/recipe_cache.json";
+        try {
+            json j = json::array();
+            {
+                std::lock_guard<std::mutex> lock(s_mutex);
+                for (const auto& [output_id, r] : s_recipes) {
+                    json rj;
+                    rj["id"] = r.id;
+                    rj["out"] = r.output_item_id;
+                    rj["cnt"] = r.output_item_count;
+                    rj["type"] = r.type;
+                    rj["rat"] = r.min_rating;
+                    rj["auto"] = r.auto_learned;
+                    rj["disc"] = r.disciplines;
+                    json ings = json::array();
+                    for (const auto& ing : r.ingredients) {
+                        ings.push_back({{"id", ing.item_id}, {"c", ing.count}});
+                    }
+                    rj["ing"] = ings;
+                    j.push_back(rj);
+                }
+            }
+            std::ofstream file(path);
+            if (!file.is_open()) return false;
+            file << j.dump();
+            file.flush();
+            return true;
+        } catch (...) {
+            return false;
+        }
+    }
+
+    bool TPAPI::LoadRecipeCache() {
+        std::string path = GetDataDirectory() + "/recipe_cache.json";
+        std::ifstream file(path);
+        if (!file.is_open()) return false;
+        try {
+            json j;
+            file >> j;
+            if (!j.is_array()) return false;
+
+            std::lock_guard<std::mutex> lock(s_mutex);
+            s_recipes.clear();
+            for (const auto& rj : j) {
+                Recipe r;
+                r.id = rj.value("id", (uint32_t)0);
+                r.output_item_id = rj.value("out", (uint32_t)0);
+                r.output_item_count = rj.value("cnt", 1);
+                r.type = rj.value("type", "");
+                r.min_rating = rj.value("rat", 0);
+                r.auto_learned = rj.value("auto", false);
+                if (rj.contains("disc") && rj["disc"].is_array()) {
+                    for (const auto& d : rj["disc"])
+                        r.disciplines.push_back(d.get<std::string>());
+                }
+                if (rj.contains("ing") && rj["ing"].is_array()) {
+                    for (const auto& ing : rj["ing"]) {
+                        RecipeIngredient ri;
+                        ri.item_id = ing.value("id", (uint32_t)0);
+                        ri.count = ing.value("c", 0);
+                        r.ingredients.push_back(ri);
+                    }
+                }
+                if (r.output_item_id > 0) {
+                    s_recipes[r.output_item_id] = r;
+                }
+            }
+
+            s_recipe_fetch_status = FetchStatus::Success;
+            s_recipe_fetch_message = "Recipes loaded (" + std::to_string(s_recipes.size()) + ")";
             return true;
         } catch (...) {
             return false;

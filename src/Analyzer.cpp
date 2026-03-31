@@ -386,6 +386,99 @@ namespace FlipOut {
         return results;
     }
 
+    // --- Crafting Profit Analysis ---
+
+    std::vector<CraftingProfit> Analyzer::FindCraftingProfits(const CraftingFilter& filter) {
+        std::vector<CraftingProfit> results;
+
+        auto prices = TPAPI::GetAllPrices();
+        if (prices.empty()) return results;
+
+        const auto& recipes = TPAPI::GetRecipesByOutput();
+        if (recipes.empty()) return results;
+
+        for (const auto& [output_id, recipe] : recipes) {
+            if (recipe.ingredients.empty()) continue;
+            if (recipe.output_item_count <= 0) continue;
+
+            // Need TP price for the output item
+            auto out_it = prices.find(output_id);
+            if (out_it == prices.end()) continue;
+            if (out_it->second.sell_price <= 0) continue;
+
+            int sell_price = out_it->second.sell_price;
+            int buy_price_out = out_it->second.buy_price;
+            int sell_qty = out_it->second.sell_quantity;
+
+            // Filter by minimum sell volume
+            if (sell_qty < filter.min_sell_volume) continue;
+
+            // Fastest: sell to buy orders, Balanced/Patient: sell via listing
+            int output_unit_price = (filter.mode == 0) ? buy_price_out : sell_price;
+            if (output_unit_price <= 0) continue;
+
+            // Calculate total ingredient cost
+            int total_cost = 0;
+            bool valid = true;
+            std::vector<std::pair<uint32_t, int>> ing_list;
+
+            for (const auto& ing : recipe.ingredients) {
+                auto ing_it = prices.find(ing.item_id);
+                if (ing_it == prices.end()) { valid = false; break; }
+                // Patient: buy via buy orders (buy_price), Fastest/Balanced: buy instantly (sell_price)
+                int ing_price = (filter.mode == 2) ? ing_it->second.buy_price : ing_it->second.sell_price;
+                if (ing_price <= 0) { valid = false; break; }
+                total_cost += ing_price * ing.count;
+                ing_list.push_back({ing.item_id, ing.count});
+            }
+            if (!valid || total_cost <= 0) continue;
+
+            // Revenue from selling output (after 15% TP tax)
+            int revenue = output_unit_price * recipe.output_item_count - CalcTotalTax(output_unit_price * recipe.output_item_count);
+            int profit = revenue - total_cost;
+
+            if (profit < filter.min_profit) continue;
+
+            float roi = (float)profit / (float)total_cost * 100.0f;
+            if (roi < filter.min_roi) continue;
+
+            CraftingProfit cp;
+            cp.item_id = output_id;
+            cp.recipe_id = recipe.id;
+            cp.recipe_type = recipe.type;
+            cp.output_count = recipe.output_item_count;
+            cp.ingredient_cost = total_cost;
+            cp.sell_price = output_unit_price;
+            cp.sell_revenue = revenue;
+            cp.profit = profit;
+            cp.roi = roi;
+            cp.sell_quantity = sell_qty;
+            cp.ingredients = ing_list;
+
+            const auto* info = TPAPI::GetItemInfo(output_id);
+            if (info) {
+                cp.name = info->name;
+                cp.rarity = info->rarity;
+            } else {
+                cp.name = "Item #" + std::to_string(output_id);
+            }
+
+            results.push_back(cp);
+        }
+
+        // Sort by profit descending
+        std::sort(results.begin(), results.end(),
+            [](const CraftingProfit& a, const CraftingProfit& b) {
+                return a.profit > b.profit;
+            });
+
+        if (filter.max_results > 0 && (int)results.size() > filter.max_results) {
+            results.resize(filter.max_results);
+        }
+
+        return results;
+    }
+
     // --- Formatting ---
 
     std::string Analyzer::FormatCoins(int copper) {

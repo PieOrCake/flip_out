@@ -42,6 +42,24 @@ namespace FlipOut {
         int level = 0;
     };
 
+    // Recipe ingredient
+    struct RecipeIngredient {
+        uint32_t item_id = 0;
+        int count = 0;
+    };
+
+    // Crafting recipe from /v2/recipes
+    struct Recipe {
+        uint32_t id = 0;
+        uint32_t output_item_id = 0;
+        int output_item_count = 1;
+        std::string type;               // e.g. "Refinement", "Weapon", "Armor"
+        int min_rating = 0;
+        std::vector<std::string> disciplines;
+        std::vector<RecipeIngredient> ingredients;
+        bool auto_learned = false;
+    };
+
     // Player transaction from /v2/commerce/transactions
     // (fetched via Hoard & Seek API proxy)
     struct TPTransaction {
@@ -101,6 +119,28 @@ namespace FlipOut {
         // Access the full price map (thread-safe copy)
         static std::unordered_map<uint32_t, TPPrice> GetAllPrices();
 
+        // Lightweight check: are there any prices loaded?
+        static bool HasPrices();
+
+        // --- Recipe API ---
+
+        // Fetch all recipe IDs from /v2/recipes
+        static std::vector<uint32_t> FetchAllRecipeIds();
+
+        // Fetch recipe details for a batch of IDs
+        static std::vector<Recipe> FetchRecipes(const std::vector<uint32_t>& recipe_ids);
+
+        // Fetch all recipes (async, updates progress)
+        static void FetchAllRecipesAsync();
+        static FetchStatus GetRecipeFetchStatus();
+        static const std::string& GetRecipeFetchMessage();
+
+        // Recipe cache
+        static bool LoadRecipeCache();
+        static bool SaveRecipeCache();
+        static const std::unordered_map<uint32_t, Recipe>& GetRecipesByOutput();
+        static size_t GetRecipeCount();
+
     private:
         static FetchStatus s_bulk_fetch_status;
         static std::string s_bulk_fetch_message;
@@ -112,6 +152,11 @@ namespace FlipOut {
 
         // item_id -> cached item info
         static std::unordered_map<uint32_t, ItemInfo> s_item_cache;
+
+        // output_item_id -> recipe (one recipe per output for simplicity)
+        static std::unordered_map<uint32_t, Recipe> s_recipes;
+        static FetchStatus s_recipe_fetch_status;
+        static std::string s_recipe_fetch_message;
 
         static std::mutex s_mutex;
     };

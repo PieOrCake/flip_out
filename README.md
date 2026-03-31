@@ -5,6 +5,8 @@ A Guild Wars 2 addon for the [Nexus](https://raidcore.gg/Nexus) framework that t
 This project is still in development and testing.
 
 ![Flip Out main window](screenshots/main_window.png)
+![Crafting tab](screenshots/crafting.png)
+![Liquidate tab](screenshots/liquidate.png)
 
 ## AI Notice
 
@@ -24,6 +26,22 @@ If an LLM creating software upsets you, then perhaps this repo isn't for you. Mo
 - **Sell Opportunities** — Surfaces items you own that are currently selling above their historical average (requires [Hoard & Seek](https://github.com/PieOrCake/hoard_and_seek))
 - **Market Movers** — Detects items with significant price or volume spikes compared to their historical averages, ranked by spike intensity
 - **Owned Item Highlighting** — Items you own are highlighted with a gold tint and owned count in both the Flips and Market Movers tables (requires Hoard & Seek)
+
+### Crafting Tab
+
+- **Crafting Profit Calculator** — Fetches all recipes from the GW2 API and calculates profit per craft based on ingredient buy prices and output sell prices
+- **Crafting Modes** — Fastest (instant buy ingredients, instant sell output), Balanced (instant buy, list output), Patient (list buy, list output)
+- **Known Recipes Filter** — Optionally show only recipes your account has unlocked (requires Hoard & Seek)
+- **Ingredient Tooltips** — Hover over a recipe to see ingredient details, including owned counts and cost savings from materials you already have
+- **Sortable Columns** — Sort by profit, ROI, volume, or any other column
+
+### Liquidate Tab
+
+- **Owned Item Valuation** — Shows the top 50 most valuable tradeable items you own across all storage locations
+- **Instant & Listed Totals** — Both values include the 15% TP tax for accurate comparison
+- **Smart Filtering** — Excludes Legendary Armory and equipped items that can't be sold
+- **Quick Gold Decisions** — Sorted by instant sell value to help you find fast gold
+- **Requires Hoard & Seek** — Queries H&S's local account cache for owned item data
 
 ### Watchlist Tab
 
@@ -48,8 +66,10 @@ If an LLM creating software upsets you, then perhaps this repo isn't for you. Mo
 
 ### General
 
+- **Colored Coin Display** — Gold, silver, and copper values are color-coded for easy reading
 - **Right-Click Context Menus** — Right-click any item row to add/remove from watchlist, search in Hoard & Seek, or view price history
 - **Item Icons** — Async icon downloading from the GW2 render API with texture caching
+- **Quick Access Toggle** — Show or hide the Quick Access bar icon from settings
 - **Persistent Storage** — Price history, watchlist, item cache, and config saved to disk as JSON
 - **Community Seed Data** — New users automatically download community price history from this repo so features like Market Movers and Sell Opportunities work immediately
 
@@ -60,8 +80,10 @@ Flip Out integrates with [Hoard & Seek](https://github.com/PieOrCake/hoard_and_s
 - **Owned item data** — Know which flip candidates and market movers you already own
 - **Account search** — Search your account storage directly from item context menus
 - **Authenticated API calls** — Transaction data (pending buys/sells) via H&S's API key
+- **Crafting unlocks** — Filter crafting recipes to only those your account has unlocked
+- **Liquidate tab** — Full inventory valuation using H&S's local account cache
 
-Flip Out works without Hoard & Seek, but the Sell Opportunities, owned item highlighting, and Transactions features will be unavailable.
+Flip Out works without Hoard & Seek, but Sell Opportunities, owned item highlighting, Crafting unlock filtering, Liquidate, and Transactions features will be unavailable.
 
 ## Requirements
 
@@ -106,8 +128,10 @@ Copy `FlipOut.dll` to your GW2 Nexus addons directory:
 2. The market scan starts automatically on load — results should be ready when you open the window
 3. Browse flip opportunities in the **Flips** tab
 4. Check the **Sell Opportunities** and **Market Movers** sections for items you own or items that are spiking
-5. Right-click any item to add it to your **Watchlist**, search in Hoard & Seek, or view its **Price History**
-6. Check the **Transactions** tab to see your pending orders (requires Hoard & Seek)
+5. Check the **Crafting** tab for profitable recipes to craft
+6. Check the **Liquidate** tab to see which owned items are worth selling
+7. Right-click any item to add it to your **Watchlist**, search in Hoard & Seek, or view its **Price History**
+8. Check the **Transactions** tab to see your pending orders (requires Hoard & Seek)
 
 ## How Flips Work
 
@@ -133,7 +157,7 @@ The seed data is sourced from the public GW2 API. The Trading Post is global acr
 | `dllmain.cpp` | Nexus lifecycle, ImGui UI (tabs, tables, graphs, context menus) |
 | `TPAPI.h/cpp` | GW2 Trading Post API client (public endpoints: prices, listings, item info) |
 | `PriceDB.h/cpp` | Price history storage, watchlist, seed import/export |
-| `Analyzer.h/cpp` | Flip detection, sell opportunities, market movers, outlier detection, trend analysis |
+| `Analyzer.h/cpp` | Flip detection, sell opportunities, market movers, crafting profits, outlier detection, trend analysis |
 | `HoardBridge.h/cpp` | Cross-addon integration with Hoard & Seek via Nexus events |
 | `IconManager.h/cpp` | Async icon downloading and texture loading |
 | `HttpClient.h/cpp` | WinINet HTTP client wrapper |
