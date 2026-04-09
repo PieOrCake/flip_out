@@ -19,7 +19,6 @@ If an LLM creating software upsets you, then perhaps this repo isn't for you. Mo
 ### Flips Tab
 
 - **Flip Scanner** — Scans all tradeable items via the public GW2 API and ranks them by profit, margin, ROI, or volume
-- **Auto-Scan** — Market scan starts automatically when the addon loads, so results are ready by the time you log in
 - **Scan Cooldown** — 10-minute minimum between scans to avoid excessive API usage
 - **Last Scan Timestamp** — Shows how long ago the last scan completed
 - **Outlier Detection** — Filters manipulated prices to prevent skewed recommendations
@@ -125,7 +124,7 @@ Copy `FlipOut.dll` to your GW2 Nexus addons directory:
 ## Usage
 
 1. Open the addon with **Ctrl+Shift+T** or via the Nexus quick access bar
-2. The market scan starts automatically on load — results should be ready when you open the window
+2. Click **Scan Market** on the Flips tab to fetch current prices
 3. Browse flip opportunities in the **Flips** tab
 4. Check the **Sell Opportunities** and **Market Movers** sections for items you own or items that are spiking
 5. Check the **Crafting** tab for profitable recipes to craft
@@ -162,12 +161,9 @@ The seed data is sourced from the public GW2 API. The Trading Post is global acr
 | `IconManager.h/cpp` | Async icon downloading and texture loading |
 | `HttpClient.h/cpp` | WinINet HTTP client wrapper |
 
-## Compatibility
+## License
 
-- **Nexus API**: v6
-- **ImGui**: v1.80
-- **nlohmann/json**: v3.11.3
-- Matched to [Hoard & Seek](https://github.com/PieOrCake/hoard_and_seek) for compatibility
+MIT
 
 ## Third-Party Licenses
 
@@ -177,7 +173,3 @@ The seed data is sourced from the public GW2 API. The Trading Post is global acr
 | [nlohmann/json](https://github.com/nlohmann/json) | v3.11.3 | MIT | [License](https://github.com/nlohmann/json/blob/develop/LICENSE.MIT) |
 | [Nexus](https://raidcore.gg/Nexus) | API v6 | MIT | [License](https://github.com/RaidcoreGG/RCGG-lib-nexus-api/blob/main/LICENSE) |
 | [Hoard & Seek API](https://github.com/PieOrCake/hoard_and_seek) | v2 | MIT | [License](https://github.com/PieOrCake/hoard_and_seek/blob/main/LICENSE) |
-
-## License
-
-MIT

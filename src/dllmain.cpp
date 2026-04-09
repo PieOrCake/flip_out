@@ -8,6 +8,8 @@
 #include <thread>
 #include <chrono>
 #include <cfloat>
+#include <atomic>
+#include <mutex>
 #include <unordered_set>
 
 #include "nexus/Nexus.h"
@@ -94,6 +96,22 @@ static bool g_SellOppsDirty = true;
 // Market movers state
 static std::vector<FlipOut::MarketMover> g_MarketMovers;
 static bool g_MoversDirty = true;
+
+// Async analysis results (written by background threads, read by render thread)
+static std::atomic<bool> g_AnalysisBusy{false};
+static std::mutex g_AnalysisMutex;
+static std::vector<FlipOut::FlipOpportunity> g_FlipsPending;
+static std::vector<FlipOut::SellOpportunity> g_SellOppsPending;
+static std::vector<FlipOut::MarketMover> g_MoversPending;
+static std::atomic<bool> g_FlipsPendingReady{false};
+static std::atomic<bool> g_SellOppsPendingReady{false};
+static std::atomic<bool> g_MoversPendingReady{false};
+static std::vector<FlipOut::CraftingProfit> g_CraftingPending;
+static std::atomic<bool> g_CraftingPendingReady{false};
+
+// Data loading state
+static std::atomic<bool> g_DataLoading{false};
+static std::atomic<bool> g_DataLoaded{false};
 
 // Price history window state
 static bool g_PriceHistoryOpen = false;
@@ -302,6 +320,41 @@ static void RenderPriceHistoryWindow() {
     std::vector<FlipOut::PriceSnapshot> history;
     for (const auto& snap : all_history) {
         if (snap.timestamp >= cutoff) history.push_back(snap);
+    }
+
+    // Downsample for smoother graphs: 1D=all, 1W=2/day(12h), 1M/3M/6M=1/day(24h)
+    if (g_PriceHistoryRange >= 1 && history.size() > 2) {
+        int bucket_secs = (g_PriceHistoryRange == 1) ? 12 * 3600 : 24 * 3600;
+        std::vector<FlipOut::PriceSnapshot> downsampled;
+        downsampled.reserve(history.size());
+        time_t bucket_start = history.front().timestamp;
+        long long sum_buy = 0, sum_sell = 0;
+        int count = 0;
+        time_t last_ts = 0;
+        for (const auto& s : history) {
+            if (s.timestamp - bucket_start >= bucket_secs && count > 0) {
+                FlipOut::PriceSnapshot avg;
+                avg.timestamp = last_ts;
+                avg.buy_price = (int)(sum_buy / count);
+                avg.sell_price = (int)(sum_sell / count);
+                downsampled.push_back(avg);
+                bucket_start = s.timestamp;
+                sum_buy = sum_sell = 0;
+                count = 0;
+            }
+            sum_buy += s.buy_price;
+            sum_sell += s.sell_price;
+            last_ts = s.timestamp;
+            count++;
+        }
+        if (count > 0) {
+            FlipOut::PriceSnapshot avg;
+            avg.timestamp = last_ts;
+            avg.buy_price = (int)(sum_buy / count);
+            avg.sell_price = (int)(sum_sell / count);
+            downsampled.push_back(avg);
+        }
+        history = std::move(downsampled);
     }
 
     if (history.size() < 2) {
@@ -562,6 +615,9 @@ static void RenderFlipsTab() {
             ImGui::PopStyleVar();
         } else {
             if (ImGui::Button("Scan Market", ImVec2(btnW, 0))) {
+                if (FlipOut::HoardBridge::IsDataAvailable()) {
+                    FlipOut::HoardBridge::RequestRefresh();
+                }
                 FlipOut::TPAPI::FetchAllPricesAsync();
                 g_FlipsDirty = true;
             }
@@ -588,7 +644,7 @@ static void RenderFlipsTab() {
         }
     }
 
-    // When bulk fetch completes, record prices and mark flips dirty
+    // When bulk fetch completes, record prices in background and mark analysis dirty
     {
         static FlipOut::FetchStatus s_prevStatus = FlipOut::FetchStatus::Idle;
         if (fetchStatus == FlipOut::FetchStatus::Success && s_prevStatus != FlipOut::FetchStatus::Success) {
@@ -596,43 +652,47 @@ static void RenderFlipsTab() {
             g_CraftingDirty = true;
             g_HasScanned = true;
             g_LastScanTime = std::chrono::steady_clock::now();
-            // Record current prices into history DB
-            auto prices = FlipOut::TPAPI::GetAllPrices();
-            std::unordered_map<uint32_t, FlipOut::PriceSnapshot> snaps;
-            for (const auto& [id, p] : prices) {
-                FlipOut::PriceSnapshot s;
-                s.buy_price = p.buy_price;
-                s.sell_price = p.sell_price;
-                s.buy_quantity = p.buy_quantity;
-                s.sell_quantity = p.sell_quantity;
-                snaps[id] = s;
-            }
-            FlipOut::PriceDB::RecordBulkPrices(snaps);
-            FlipOut::PriceDB::Save();
 
-            // Query Hoard & Seek for owned status of top flip candidates and market movers
-            if (FlipOut::HoardBridge::IsDataAvailable()) {
-                // Collect unique item IDs to query
-                std::vector<uint32_t> queryIds;
-                auto topFlips = FlipOut::Analyzer::FindFlips(g_FlipFilter);
-                for (const auto& f : topFlips) queryIds.push_back(f.item_id);
-                auto topMovers = FlipOut::Analyzer::FindMarketMovers(20.0f, 3, 100, 50);
-                for (const auto& m : topMovers) queryIds.push_back(m.item_id);
-                FlipOut::HoardBridge::QueryItems(queryIds);
-            }
+            // Record prices to history DB in background thread (heavy: ~27k items)
+            std::thread([]() {
+                auto prices = FlipOut::TPAPI::GetAllPrices();
+                std::unordered_map<uint32_t, FlipOut::PriceSnapshot> snaps;
+                snaps.reserve(prices.size());
+                for (const auto& [id, p] : prices) {
+                    FlipOut::PriceSnapshot s;
+                    s.buy_price = p.buy_price;
+                    s.sell_price = p.sell_price;
+                    s.buy_quantity = p.buy_quantity;
+                    s.sell_quantity = p.sell_quantity;
+                    snaps[id] = s;
+                }
+                FlipOut::PriceDB::RecordBulkPrices(snaps);
+                FlipOut::PriceDB::Save();
+            }).detach();
         }
         s_prevStatus = fetchStatus;
     }
 
-    // Recompute flips if dirty
-    if (g_FlipsDirty) {
-        g_Flips = FlipOut::Analyzer::FindFlips(g_FlipFilter);
-        g_FlipsDirty = false;
+    // Pick up completed async analysis results
+    if (g_FlipsPendingReady) {
+        std::lock_guard<std::mutex> lock(g_AnalysisMutex);
+        g_Flips = std::move(g_FlipsPending);
+        g_FlipsPendingReady = false;
         g_SellOppsDirty = true;
         g_MoversDirty = true;
     }
+    if (g_MoversPendingReady) {
+        std::lock_guard<std::mutex> lock(g_AnalysisMutex);
+        g_MarketMovers = std::move(g_MoversPending);
+        g_MoversPendingReady = false;
+    }
+    if (g_SellOppsPendingReady) {
+        std::lock_guard<std::mutex> lock(g_AnalysisMutex);
+        g_SellOpps = std::move(g_SellOppsPending);
+        g_SellOppsPendingReady = false;
+    }
 
-    // Recompute sell opportunities when owned item data changes
+    // Dispatch analysis to background threads when dirty
     {
         static size_t s_lastOwnedCount = 0;
         size_t curOwnedCount = FlipOut::HoardBridge::GetOwnedItemCount();
@@ -641,15 +701,43 @@ static void RenderFlipsTab() {
             g_SellOppsDirty = true;
         }
     }
-    if (g_SellOppsDirty && FlipOut::HoardBridge::GetOwnedItemCount() > 0) {
-        g_SellOpps = FlipOut::Analyzer::FindSellOpportunities(20.0f, 3);
-        g_SellOppsDirty = false;
-    }
-
-    // Recompute market movers if dirty
-    if (g_MoversDirty) {
-        g_MarketMovers = FlipOut::Analyzer::FindMarketMovers(20.0f, 3, 100, 50);
+    if (g_FlipsDirty && !g_AnalysisBusy) {
+        g_FlipsDirty = false;
+        g_AnalysisBusy = true;
+        auto filter = g_FlipFilter;
+        std::thread([filter]() {
+            auto result = FlipOut::Analyzer::FindFlips(filter);
+            {
+                std::lock_guard<std::mutex> lock(g_AnalysisMutex);
+                g_FlipsPending = std::move(result);
+            }
+            g_FlipsPendingReady = true;
+            g_AnalysisBusy = false;
+        }).detach();
+    } else if (g_MoversDirty && !g_AnalysisBusy) {
         g_MoversDirty = false;
+        g_AnalysisBusy = true;
+        std::thread([]() {
+            auto result = FlipOut::Analyzer::FindMarketMovers(20.0f, 3, 100, 50);
+            {
+                std::lock_guard<std::mutex> lock(g_AnalysisMutex);
+                g_MoversPending = std::move(result);
+            }
+            g_MoversPendingReady = true;
+            g_AnalysisBusy = false;
+        }).detach();
+    } else if (g_SellOppsDirty && !g_AnalysisBusy && FlipOut::HoardBridge::GetOwnedItemCount() > 0) {
+        g_SellOppsDirty = false;
+        g_AnalysisBusy = true;
+        std::thread([]() {
+            auto result = FlipOut::Analyzer::FindSellOpportunities(20.0f, 3);
+            {
+                std::lock_guard<std::mutex> lock(g_AnalysisMutex);
+                g_SellOppsPending = std::move(result);
+            }
+            g_SellOppsPendingReady = true;
+            g_AnalysisBusy = false;
+        }).detach();
     }
 
     ImGui::Separator();
@@ -708,6 +796,9 @@ static void RenderFlipsTab() {
                     ImGui::Selectable("##row", false,
                         ImGuiSelectableFlags_SpanAllColumns | ImGuiSelectableFlags_AllowItemOverlap,
                         ImVec2(0, ICON_SIZE));
+                    if (ImGui::IsItemClicked(0)) {
+                        OpenPriceHistory(opp.item_id, opp.name, opp.rarity);
+                    }
                     if (ImGui::BeginPopupContextItem("##sell_ctx")) {
                         bool watched = FlipOut::PriceDB::IsOnWatchlist(opp.item_id);
                         if (watched) {
@@ -836,6 +927,9 @@ static void RenderFlipsTab() {
                     ImGui::Selectable("##row", false,
                         ImGuiSelectableFlags_SpanAllColumns | ImGuiSelectableFlags_AllowItemOverlap,
                         ImVec2(0, ICON_SIZE));
+                    if (ImGui::IsItemClicked(0)) {
+                        OpenPriceHistory(m.item_id, m.name, m.rarity);
+                    }
                     if (ImGui::BeginPopupContextItem("##mover_ctx")) {
                         bool watched = FlipOut::PriceDB::IsOnWatchlist(m.item_id);
                         if (watched) {
@@ -975,6 +1069,9 @@ static void RenderFlipsTab() {
             ImGui::Selectable("##row", false,
                 ImGuiSelectableFlags_SpanAllColumns | ImGuiSelectableFlags_AllowItemOverlap,
                 ImVec2(0, ICON_SIZE));
+            if (ImGui::IsItemClicked(0)) {
+                OpenPriceHistory(flip.item_id, flip.name, flip.rarity);
+            }
             if (ImGui::BeginPopupContextItem("##flip_ctx")) {
                 bool watched = FlipOut::PriceDB::IsOnWatchlist(flip.item_id);
                 if (watched) {
@@ -1091,8 +1188,6 @@ static void RenderWatchlistTab() {
     ImGui::Text("%d items watched", (int)watchlist.size());
     ImGui::Separator();
 
-    auto prices_wl = FlipOut::TPAPI::GetAllPrices();
-
     if (ImGui::BeginTable("##watchlist", 9,
         ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY |
         ImGuiTableFlags_Resizable | ImGuiTableFlags_SizingStretchProp | ImGuiTableFlags_Sortable,
@@ -1121,12 +1216,13 @@ static void RenderWatchlistTab() {
                 std::sort(wl_copy.begin(), wl_copy.end(), [&](const FlipOut::WatchlistEntry& a, const FlipOut::WatchlistEntry& b) {
                     const auto* ai = FlipOut::TPAPI::GetItemInfo(a.item_id);
                     const auto* bi = FlipOut::TPAPI::GetItemInfo(b.item_id);
-                    auto pa = prices_wl.find(a.item_id);
-                    auto pb = prices_wl.find(b.item_id);
-                    int ab = pa != prices_wl.end() ? pa->second.buy_price : 0;
-                    int as_ = pa != prices_wl.end() ? pa->second.sell_price : 0;
-                    int bb_ = pb != prices_wl.end() ? pb->second.buy_price : 0;
-                    int bs = pb != prices_wl.end() ? pb->second.sell_price : 0;
+                    FlipOut::TPPrice pa{}, pb{};
+                    FlipOut::TPAPI::GetPrice(a.item_id, pa);
+                    FlipOut::TPAPI::GetPrice(b.item_id, pb);
+                    int ab = pa.buy_price;
+                    int as_ = pa.sell_price;
+                    int bb_ = pb.buy_price;
+                    int bs = pb.sell_price;
                     int cmp = 0;
                     switch (s.ColumnIndex) {
                         case 0: { std::string an = ai ? ai->name : ""; std::string bn = bi ? bi->name : ""; cmp = an.compare(bn); } break;
@@ -1154,15 +1250,19 @@ static void RenderWatchlistTab() {
             std::string rarity = info ? info->rarity : "";
             std::string iconUrl = info ? info->icon_url : "";
 
-            auto priceIt = prices_wl.find(entry.item_id);
-            int buy = priceIt != prices_wl.end() ? priceIt->second.buy_price : 0;
-            int sell = priceIt != prices_wl.end() ? priceIt->second.sell_price : 0;
+            FlipOut::TPPrice tp{};
+            FlipOut::TPAPI::GetPrice(entry.item_id, tp);
+            int buy = tp.buy_price;
+            int sell = tp.sell_price;
 
             // Item
             ImGui::TableNextColumn();
             ImGui::Selectable("##row", false,
                 ImGuiSelectableFlags_SpanAllColumns | ImGuiSelectableFlags_AllowItemOverlap,
                 ImVec2(0, ICON_SIZE));
+            if (ImGui::IsItemClicked(0)) {
+                OpenPriceHistory(entry.item_id, name, rarity);
+            }
             if (ImGui::BeginPopupContextItem("##wl_ctx")) {
                 if (ImGui::MenuItem("Search in Hoard & Seek")) {
                     FlipOut::HoardBridge::SearchInHoard(name);
@@ -1329,6 +1429,9 @@ static void RenderTransactionsTab() {
                     std::string rarity = info ? info->rarity : "";
                     ImGui::Selectable("##row", false,
                         ImGuiSelectableFlags_SpanAllColumns | ImGuiSelectableFlags_AllowItemOverlap);
+                    if (ImGui::IsItemClicked(0)) {
+                        OpenPriceHistory(tx.item_id, name, rarity);
+                    }
                     if (ImGui::BeginPopupContextItem("##txb_ctx")) {
                         bool watched = FlipOut::PriceDB::IsOnWatchlist(tx.item_id);
                         if (watched) {
@@ -1412,6 +1515,9 @@ static void RenderTransactionsTab() {
                     std::string rarity = info ? info->rarity : "";
                     ImGui::Selectable("##row", false,
                         ImGuiSelectableFlags_SpanAllColumns | ImGuiSelectableFlags_AllowItemOverlap);
+                    if (ImGui::IsItemClicked(0)) {
+                        OpenPriceHistory(tx.item_id, name, rarity);
+                    }
                     if (ImGui::BeginPopupContextItem("##txs_ctx")) {
                         bool watched = FlipOut::PriceDB::IsOnWatchlist(tx.item_id);
                         if (watched) {
@@ -1558,12 +1664,30 @@ static void RenderCraftingTab() {
 
     if (filterChanged) g_CraftingDirty = true;
 
-    if (g_CraftingDirty) {
-        g_CraftingFilter.mode = g_CraftingMode;
-        g_CraftingProfits = FlipOut::Analyzer::FindCraftingProfits(g_CraftingFilter);
-        g_CraftingRecipesQueried = false; // Re-query unlocks for new results
-        g_CraftingIngredientsQueried = false; // Re-query ingredient ownership
+    // Pick up completed async crafting results
+    if (g_CraftingPendingReady) {
+        std::lock_guard<std::mutex> lock(g_AnalysisMutex);
+        g_CraftingProfits = std::move(g_CraftingPending);
+        g_CraftingPendingReady = false;
+        g_CraftingRecipesQueried = false;
+        g_CraftingIngredientsQueried = false;
+    }
+
+    if (g_CraftingDirty && !g_AnalysisBusy) {
         g_CraftingDirty = false;
+        g_AnalysisBusy = true;
+        FlipOut::CraftingFilter filter;
+        filter.mode = g_CraftingMode;
+        g_CraftingFilter = filter;
+        std::thread([filter]() {
+            auto result = FlipOut::Analyzer::FindCraftingProfits(filter);
+            {
+                std::lock_guard<std::mutex> lock(g_AnalysisMutex);
+                g_CraftingPending = std::move(result);
+            }
+            g_CraftingPendingReady = true;
+            g_AnalysisBusy = false;
+        }).detach();
     }
 
     if (g_CraftingProfits.empty()) {
@@ -1625,6 +1749,9 @@ static void RenderCraftingTab() {
             ImGui::Selectable("##row", false,
                 ImGuiSelectableFlags_SpanAllColumns | ImGuiSelectableFlags_AllowItemOverlap,
                 ImVec2(0, ICON_SIZE));
+            if (ImGui::IsItemClicked(0)) {
+                OpenPriceHistory(cp.item_id, cp.name, cp.rarity);
+            }
             if (ImGui::BeginPopupContextItem("##craft_ctx")) {
                 bool watched = FlipOut::PriceDB::IsOnWatchlist(cp.item_id);
                 if (watched) {
@@ -1687,7 +1814,6 @@ static void RenderCraftingTab() {
                 ImGui::Text("Ingredients:");
                 bool hsAvail = FlipOut::HoardBridge::IsDataAvailable();
                 int owned_savings = 0;
-                auto all_prices = FlipOut::TPAPI::GetAllPrices();
                 for (const auto& [ing_id, ing_count] : cp.ingredients) {
                     const auto* ing_info = FlipOut::TPAPI::GetItemInfo(ing_id);
                     std::string ing_name = ing_info ? ing_info->name : ("Item #" + std::to_string(ing_id));
@@ -1697,14 +1823,16 @@ static void RenderCraftingTab() {
                         if (have >= ing_count) {
                             ImGui::TextColored(ImVec4(0.35f, 0.82f, 0.35f, 1.0f),
                                 "  %dx %s [%d owned]", ing_count, ing_name.c_str(), have);
-                            auto pit = all_prices.find(ing_id);
-                            int ing_unit = pit != all_prices.end() ? (g_CraftingMode == 2 ? pit->second.buy_price : pit->second.sell_price) : 0;
+                            FlipOut::TPPrice ing_tp{};
+                            FlipOut::TPAPI::GetPrice(ing_id, ing_tp);
+                            int ing_unit = g_CraftingMode == 2 ? ing_tp.buy_price : ing_tp.sell_price;
                             owned_savings += ing_unit * ing_count;
                         } else if (have > 0) {
                             ImGui::TextColored(ImVec4(1.0f, 0.85f, 0.0f, 1.0f),
                                 "  %dx %s [%d/%d owned]", ing_count, ing_name.c_str(), have, ing_count);
-                            auto pit = all_prices.find(ing_id);
-                            int ing_unit = pit != all_prices.end() ? (g_CraftingMode == 2 ? pit->second.buy_price : pit->second.sell_price) : 0;
+                            FlipOut::TPPrice ing_tp{};
+                            FlipOut::TPAPI::GetPrice(ing_id, ing_tp);
+                            int ing_unit = g_CraftingMode == 2 ? ing_tp.buy_price : ing_tp.sell_price;
                             owned_savings += ing_unit * have;
                         } else {
                             ImGui::Text("  %dx %s", ing_count, ing_name.c_str());
@@ -1865,7 +1993,7 @@ static void RenderLiquidateTab() {
         if (g_LiquidateLoaded) {
             ImGui::SameLine();
             ImGui::TextColored(ImVec4(0.5f, 0.5f, 0.5f, 1.0f),
-                "%d tradeable items", (int)g_LiquidateItems.size());
+                "Your %d biggest money-makers", (int)g_LiquidateItems.size());
         }
     }
 
@@ -1942,6 +2070,9 @@ static void RenderLiquidateTab() {
             ImGui::Selectable("##row", false,
                 ImGuiSelectableFlags_SpanAllColumns | ImGuiSelectableFlags_AllowItemOverlap,
                 ImVec2(0, ICON_SIZE));
+            if (ImGui::IsItemClicked(0)) {
+                OpenPriceHistory(e.item_id, e.name, e.rarity);
+            }
             if (ImGui::BeginPopupContextItem("##liq_ctx")) {
                 bool watched = FlipOut::PriceDB::IsOnWatchlist(e.item_id);
                 if (watched) {
@@ -2038,7 +2169,6 @@ static void RenderSearchTab() {
     ImGui::Separator();
     ImGui::Text("%d results", (int)g_SearchResults.size());
 
-    auto prices = FlipOut::TPAPI::GetAllPrices();
     bool hsConnected = FlipOut::HoardBridge::IsDataAvailable();
 
     int col_count = hsConnected ? 6 : 5;
@@ -2063,12 +2193,13 @@ static void RenderSearchTab() {
                 const auto& s = specs->Specs[0];
                 bool asc = s.SortDirection == ImGuiSortDirection_Ascending;
                 std::sort(g_SearchResults.begin(), g_SearchResults.end(), [&](const FlipOut::ItemInfo& a, const FlipOut::ItemInfo& b) {
-                    auto pa = prices.find(a.id);
-                    auto pb = prices.find(b.id);
-                    int ab = pa != prices.end() ? pa->second.buy_price : 0;
-                    int as_ = pa != prices.end() ? pa->second.sell_price : 0;
-                    int bb_ = pb != prices.end() ? pb->second.buy_price : 0;
-                    int bs = pb != prices.end() ? pb->second.sell_price : 0;
+                    FlipOut::TPPrice pa{}, pb{};
+                    FlipOut::TPAPI::GetPrice(a.id, pa);
+                    FlipOut::TPAPI::GetPrice(b.id, pb);
+                    int ab = pa.buy_price;
+                    int as_ = pa.sell_price;
+                    int bb_ = pb.buy_price;
+                    int bs = pb.sell_price;
                     int cmp = 0;
                     switch (s.ColumnIndex) {
                         case 0: cmp = a.name.compare(b.name); break;
@@ -2100,6 +2231,9 @@ static void RenderSearchTab() {
             ImGui::Selectable("##row", false,
                 ImGuiSelectableFlags_SpanAllColumns | ImGuiSelectableFlags_AllowItemOverlap,
                 ImVec2(0, ICON_SIZE));
+            if (ImGui::IsItemClicked(0)) {
+                OpenPriceHistory(item.id, item.name, item.rarity);
+            }
             if (ImGui::BeginPopupContextItem("##search_ctx")) {
                 bool watched = FlipOut::PriceDB::IsOnWatchlist(item.id);
                 if (watched) {
@@ -2128,9 +2262,10 @@ static void RenderSearchTab() {
             ImGui::SameLine();
             ImGui::TextColored(GetRarityColor(item.rarity), "%s", item.name.c_str());
 
-            auto pit = prices.find(item.id);
-            int buy = pit != prices.end() ? pit->second.buy_price : 0;
-            int sell = pit != prices.end() ? pit->second.sell_price : 0;
+            FlipOut::TPPrice pit{};
+            FlipOut::TPAPI::GetPrice(item.id, pit);
+            int buy = pit.buy_price;
+            int sell = pit.sell_price;
 
             ImGui::TableNextColumn();
             if (buy > 0) RenderCoins(buy); else ImGui::Text("---");
@@ -2190,17 +2325,18 @@ void AddonLoad(AddonAPI_t* aApi) {
     FlipOut::IconManager::Initialize(APIDefs);
     FlipOut::HoardBridge::Initialize(APIDefs);
 
-    // Load saved data
-    FlipOut::TPAPI::LoadItemCache();
-    FlipOut::TPAPI::LoadRecipeCache();
-    FlipOut::PriceDB::Load();
-    FlipOut::PriceDB::LoadWatchlist();
-
-    // Download community seed data if local history is thin
-    TryDownloadSeed();
-
-    // Start scanning immediately so results are ready by the time the user logs in
-    FlipOut::TPAPI::FetchAllPricesAsync();
+    // Load saved data in background to avoid blocking game startup
+    g_DataLoading = true;
+    g_DataLoaded = false;
+    std::thread([]() {
+        FlipOut::TPAPI::LoadItemCache();
+        FlipOut::TPAPI::LoadRecipeCache();
+        FlipOut::PriceDB::Load();
+        FlipOut::PriceDB::LoadWatchlist();
+        TryDownloadSeed();
+        g_DataLoading = false;
+        g_DataLoaded = true;
+    }).detach();
 
     // Register render functions
     APIDefs->GUI_Register(RT_Render, AddonRender);
@@ -2225,18 +2361,24 @@ void AddonLoad(AddonAPI_t* aApi) {
 }
 
 void AddonUnload() {
-    FlipOut::HoardBridge::Shutdown();
-    FlipOut::IconManager::Shutdown();
-
-    // Save state
-    FlipOut::PriceDB::Save();
-    FlipOut::PriceDB::SaveWatchlist();
-    FlipOut::TPAPI::SaveItemCache();
-
+    // Deregister UI first (fast)
     APIDefs->GUI_DeregisterCloseOnEscape("Flip Out");
     APIDefs->QuickAccess_Remove(QA_ID);
     APIDefs->GUI_Deregister(AddonOptions);
     APIDefs->GUI_Deregister(AddonRender);
+
+    FlipOut::HoardBridge::Shutdown();
+    FlipOut::IconManager::Shutdown();
+
+    // Save state in background thread, but join to ensure completion before DLL unloads
+    if (g_DataLoaded) {
+        std::thread saveThread([]() {
+            FlipOut::PriceDB::Save();
+            FlipOut::PriceDB::SaveWatchlist();
+            FlipOut::TPAPI::SaveItemCache();
+        });
+        saveThread.join();
+    }
 
     APIDefs = nullptr;
 }
@@ -2255,7 +2397,7 @@ void AddonRender() {
     FlipOut::IconManager::Tick();
 
     // Auto-refresh watchlist prices (public endpoints, no auth needed)
-    if (g_AutoRefresh) {
+    if (g_AutoRefresh && g_DataLoaded) {
         auto now = std::chrono::steady_clock::now();
         auto elapsed = std::chrono::duration_cast<std::chrono::minutes>(now - g_LastAutoRefresh).count();
         if (elapsed >= g_RefreshIntervalMin) {
@@ -2300,6 +2442,13 @@ void AddonRender() {
     if (!ImGui::Begin("Flip Out - TP Market Tracker", &g_WindowVisible,
         ImGuiWindowFlags_NoCollapse))
     {
+        ImGui::End();
+        return;
+    }
+
+    // Show loading indicator while data loads in background
+    if (g_DataLoading) {
+        ImGui::TextColored(ImVec4(1.0f, 0.85f, 0.0f, 1.0f), "Loading data...");
         ImGui::End();
         return;
     }

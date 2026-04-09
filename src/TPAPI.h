@@ -119,6 +119,9 @@ namespace FlipOut {
         // Access the full price map (thread-safe copy)
         static std::unordered_map<uint32_t, TPPrice> GetAllPrices();
 
+        // Single-item price lookup (thread-safe, no map copy)
+        static bool GetPrice(uint32_t item_id, TPPrice& out);
+
         // Lightweight check: are there any prices loaded?
         static bool HasPrices();
 

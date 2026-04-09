@@ -475,6 +475,14 @@ namespace FlipOut {
         return s_prices;
     }
 
+    bool TPAPI::GetPrice(uint32_t item_id, TPPrice& out) {
+        std::lock_guard<std::mutex> lock(s_mutex);
+        auto it = s_prices.find(item_id);
+        if (it == s_prices.end()) return false;
+        out = it->second;
+        return true;
+    }
+
     bool TPAPI::HasPrices() {
         std::lock_guard<std::mutex> lock(s_mutex);
         return !s_prices.empty();
