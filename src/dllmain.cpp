@@ -118,7 +118,7 @@ static bool g_PriceHistoryOpen = false;
 static uint32_t g_PriceHistoryItemId = 0;
 static std::string g_PriceHistoryItemName;
 static std::string g_PriceHistoryItemRarity;
-static int g_PriceHistoryRange = 2; // 0=1D, 1=1W, 2=1M, 3=3M, 4=6M
+static int g_PriceHistoryRange = 1; // 0=1W, 1=1M, 2=3M, 3=6M
 
 // Crafting state
 static std::vector<FlipOut::CraftingProfit> g_CraftingProfits;
@@ -301,10 +301,10 @@ static void RenderPriceHistoryWindow() {
     ImGui::TextColored(GetRarityColor(g_PriceHistoryItemRarity), "%s", g_PriceHistoryItemName.c_str());
 
     // Time range buttons
-    const char* range_labels[] = { "1D", "1W", "1M", "3M", "6M" };
-    const int range_hours[] = { 24, 24*7, 24*30, 24*90, 24*180 };
+    const char* range_labels[] = { "1W", "1M", "3M", "6M" };
+    const int range_hours[] = { 24*7, 24*30, 24*90, 24*180 };
     ImGui::Spacing();
-    for (int i = 0; i < 5; i++) {
+    for (int i = 0; i < 4; i++) {
         if (i > 0) ImGui::SameLine();
         bool selected = (g_PriceHistoryRange == i);
         if (selected) ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.3f, 0.5f, 0.8f, 1.0f));
@@ -314,17 +314,20 @@ static void RenderPriceHistoryWindow() {
         if (selected) ImGui::PopStyleColor();
     }
 
-    // Fetch history data filtered by time range
+    // Fetch history data filtered by time range; fall back to all data if range is too narrow
     auto all_history = FlipOut::PriceDB::GetHistory(g_PriceHistoryItemId, 0);
     time_t cutoff = std::time(nullptr) - (time_t)range_hours[g_PriceHistoryRange] * 3600;
     std::vector<FlipOut::PriceSnapshot> history;
     for (const auto& snap : all_history) {
         if (snap.timestamp >= cutoff) history.push_back(snap);
     }
+    if (history.size() < 2 && all_history.size() >= 2) {
+        history = all_history;
+    }
 
-    // Downsample for smoother graphs: 1D=all, 1W=2/day(12h), 1M/3M/6M=1/day(24h)
-    if (g_PriceHistoryRange >= 1 && history.size() > 2) {
-        int bucket_secs = (g_PriceHistoryRange == 1) ? 12 * 3600 : 24 * 3600;
+    // Downsample for smoother graphs: 1W=2/day(12h), 1M/3M/6M=1/day(24h)
+    if (history.size() > 2) {
+        int bucket_secs = (g_PriceHistoryRange == 0) ? 12 * 3600 : 24 * 3600;
         std::vector<FlipOut::PriceSnapshot> downsampled;
         downsampled.reserve(history.size());
         time_t bucket_start = history.front().timestamp;
@@ -453,13 +456,9 @@ static void RenderPriceHistoryWindow() {
         // Label
         struct tm* tm_info = localtime(&t_val);
         char tbuf[32];
-        if (g_PriceHistoryRange == 0) {
-            strftime(tbuf, sizeof(tbuf), "%H:%M", tm_info);
-        } else {
-            char mon[8];
-            strftime(mon, sizeof(mon), "%b", tm_info);
-            snprintf(tbuf, sizeof(tbuf), "%d %s", tm_info->tm_mday, mon);
-        }
+        char mon[8];
+        strftime(mon, sizeof(mon), "%b", tm_info);
+        snprintf(tbuf, sizeof(tbuf), "%d %s", tm_info->tm_mday, mon);
         ImVec2 text_size = ImGui::CalcTextSize(tbuf);
         dl->AddText(ImVec2(x - text_size.x * 0.5f, gp.y + graph_h + 4),
             IM_COL32(160, 160, 160, 255), tbuf);
@@ -1349,6 +1348,8 @@ static void RenderWatchlistTab() {
 
 // --- Transactions Tab (via Hoard & Seek API proxy) ---
 
+static int g_TxLastAccountIndex = -2; // track account changes (-2 = never loaded)
+
 static void RenderTransactionsTab() {
     if (!FlipOut::HoardBridge::IsDataAvailable()) {
         ImGui::TextColored(ImVec4(1.0f, 0.6f, 0.2f, 1.0f),
@@ -1362,13 +1363,16 @@ static void RenderTransactionsTab() {
     bool txLoading = FlipOut::HoardBridge::IsTransactionsLoading();
     bool txLoaded = FlipOut::HoardBridge::IsTransactionsLoaded();
 
-    if (!txLoaded && !txLoading) {
-        ImGui::TextColored(ImVec4(0.6f, 0.6f, 0.6f, 1.0f),
-            "Click 'Load Transactions' to view your pending TP orders (via Hoard & Seek).");
+    // Auto-load on first view, or reload on account change
+    int curAcctIdx = FlipOut::HoardBridge::GetActiveAccountIndex();
+    if (!txLoading && (!txLoaded || curAcctIdx != g_TxLastAccountIndex)) {
+        g_TxLastAccountIndex = curAcctIdx;
+        FlipOut::HoardBridge::FetchTransactions();
+        txLoading = true;
     }
 
     if (txLoading) ImGui::PushStyleVar(ImGuiStyleVar_Alpha, 0.5f);
-    if (ImGui::Button("Load Transactions") && !txLoading) {
+    if (ImGui::Button("Refresh Transactions") && !txLoading) {
         FlipOut::HoardBridge::FetchTransactions();
     }
     if (txLoading) ImGui::PopStyleVar();
@@ -1960,6 +1964,8 @@ static void FetchLiquidateData() {
     g_LiquidateScanStart = std::chrono::steady_clock::now();
 }
 
+static int g_LiqLastAccountIndex = -2; // track account changes (-2 = never loaded)
+
 static void RenderLiquidateTab() {
     bool hsAvail = FlipOut::HoardBridge::IsDataAvailable();
 
@@ -1976,6 +1982,13 @@ static void RenderLiquidateTab() {
         return;
     }
 
+    // Auto-load on first view with prices, or reload on account change
+    int curAcctIdx = FlipOut::HoardBridge::GetActiveAccountIndex();
+    if (!g_LiquidateLoading && (!g_LiquidateLoaded || curAcctIdx != g_LiqLastAccountIndex)) {
+        g_LiqLastAccountIndex = curAcctIdx;
+        FetchLiquidateData();
+    }
+
     // Scan button
     if (g_LiquidateLoading) {
         auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -1987,7 +2000,7 @@ static void RenderLiquidateTab() {
             ImGui::TextColored(ImVec4(1.0f, 0.85f, 0.0f, 1.0f), "Querying inventory...");
         }
     } else {
-        if (ImGui::Button("Get Owned Items")) {
+        if (ImGui::Button("Refresh Owned Items")) {
             FetchLiquidateData();
         }
         if (g_LiquidateLoaded) {
@@ -2313,6 +2326,135 @@ static void RenderSearchTab() {
     }
 }
 
+// --- GW2-Themed UI Style ---
+
+static ImGuiStyle g_GW2Style;
+static std::vector<ImGuiStyle> g_StyleStack;
+static bool g_GW2StyleBuilt = false;
+
+static void PushGW2Theme() {
+    g_StyleStack.push_back(ImGui::GetStyle());
+    ImGui::GetStyle() = g_GW2Style;
+}
+
+static void PopGW2Theme() {
+    if (!g_StyleStack.empty()) {
+        ImGui::GetStyle() = g_StyleStack.back();
+        g_StyleStack.pop_back();
+    }
+}
+
+static void BuildGW2Theme() {
+    g_GW2Style = ImGui::GetStyle();
+    ImGuiStyle& s = g_GW2Style;
+
+    // Rounding
+    s.WindowRounding    = 6.0f;
+    s.ChildRounding     = 4.0f;
+    s.FrameRounding     = 4.0f;
+    s.PopupRounding     = 4.0f;
+    s.ScrollbarRounding = 6.0f;
+    s.GrabRounding      = 3.0f;
+    s.TabRounding       = 4.0f;
+
+    // Spacing & padding
+    s.WindowPadding     = ImVec2(10, 10);
+    s.FramePadding      = ImVec2(6, 4);
+    s.ItemSpacing       = ImVec2(8, 5);
+    s.ItemInnerSpacing  = ImVec2(6, 4);
+    s.ScrollbarSize     = 12.0f;
+    s.GrabMinSize       = 8.0f;
+    s.WindowBorderSize  = 1.0f;
+    s.ChildBorderSize   = 1.0f;
+    s.PopupBorderSize   = 1.0f;
+    s.FrameBorderSize   = 0.0f;
+    s.TabBorderSize     = 0.0f;
+
+    // Colors — dark slate base with warm gold accents
+    ImVec4* c = s.Colors;
+
+    // Backgrounds
+    c[ImGuiCol_WindowBg]             = ImVec4(0.08f, 0.08f, 0.10f, 0.96f);
+    c[ImGuiCol_ChildBg]              = ImVec4(0.07f, 0.07f, 0.09f, 0.80f);
+    c[ImGuiCol_PopupBg]              = ImVec4(0.10f, 0.10f, 0.12f, 0.96f);
+
+    // Borders
+    c[ImGuiCol_Border]               = ImVec4(0.28f, 0.25f, 0.18f, 0.50f);
+    c[ImGuiCol_BorderShadow]         = ImVec4(0.00f, 0.00f, 0.00f, 0.00f);
+
+    // Frames (input boxes, combos)
+    c[ImGuiCol_FrameBg]              = ImVec4(0.14f, 0.13f, 0.11f, 0.80f);
+    c[ImGuiCol_FrameBgHovered]       = ImVec4(0.22f, 0.20f, 0.14f, 0.80f);
+    c[ImGuiCol_FrameBgActive]        = ImVec4(0.28f, 0.25f, 0.16f, 0.90f);
+
+    // Title bar
+    c[ImGuiCol_TitleBg]              = ImVec4(0.10f, 0.09f, 0.07f, 1.00f);
+    c[ImGuiCol_TitleBgActive]        = ImVec4(0.16f, 0.14f, 0.08f, 1.00f);
+    c[ImGuiCol_TitleBgCollapsed]     = ImVec4(0.08f, 0.07f, 0.05f, 0.75f);
+
+    // Menu bar
+    c[ImGuiCol_MenuBarBg]            = ImVec4(0.12f, 0.11f, 0.09f, 1.00f);
+
+    // Scrollbar
+    c[ImGuiCol_ScrollbarBg]          = ImVec4(0.06f, 0.06f, 0.07f, 0.60f);
+    c[ImGuiCol_ScrollbarGrab]        = ImVec4(0.30f, 0.27f, 0.18f, 0.80f);
+    c[ImGuiCol_ScrollbarGrabHovered] = ImVec4(0.40f, 0.36f, 0.22f, 0.90f);
+    c[ImGuiCol_ScrollbarGrabActive]  = ImVec4(0.50f, 0.44f, 0.26f, 1.00f);
+
+    // Checkmark, slider
+    c[ImGuiCol_CheckMark]            = ImVec4(0.90f, 0.75f, 0.25f, 1.00f);
+    c[ImGuiCol_SliderGrab]           = ImVec4(0.70f, 0.58f, 0.20f, 1.00f);
+    c[ImGuiCol_SliderGrabActive]     = ImVec4(0.85f, 0.70f, 0.25f, 1.00f);
+
+    // Buttons — warm gold
+    c[ImGuiCol_Button]               = ImVec4(0.22f, 0.20f, 0.12f, 0.80f);
+    c[ImGuiCol_ButtonHovered]        = ImVec4(0.35f, 0.30f, 0.14f, 0.90f);
+    c[ImGuiCol_ButtonActive]         = ImVec4(0.45f, 0.38f, 0.16f, 1.00f);
+
+    // Headers (selectables, collapsing headers)
+    c[ImGuiCol_Header]               = ImVec4(0.18f, 0.16f, 0.10f, 0.70f);
+    c[ImGuiCol_HeaderHovered]        = ImVec4(0.28f, 0.24f, 0.12f, 0.80f);
+    c[ImGuiCol_HeaderActive]         = ImVec4(0.35f, 0.30f, 0.14f, 0.90f);
+
+    // Separator
+    c[ImGuiCol_Separator]            = ImVec4(0.28f, 0.25f, 0.18f, 0.40f);
+    c[ImGuiCol_SeparatorHovered]     = ImVec4(0.50f, 0.42f, 0.20f, 0.70f);
+    c[ImGuiCol_SeparatorActive]      = ImVec4(0.65f, 0.55f, 0.25f, 1.00f);
+
+    // Resize grip
+    c[ImGuiCol_ResizeGrip]           = ImVec4(0.30f, 0.27f, 0.18f, 0.30f);
+    c[ImGuiCol_ResizeGripHovered]    = ImVec4(0.50f, 0.44f, 0.26f, 0.60f);
+    c[ImGuiCol_ResizeGripActive]     = ImVec4(0.65f, 0.55f, 0.25f, 0.90f);
+
+    // Tabs — gold accent for active
+    c[ImGuiCol_Tab]                  = ImVec4(0.14f, 0.13f, 0.10f, 0.86f);
+    c[ImGuiCol_TabHovered]           = ImVec4(0.35f, 0.30f, 0.14f, 0.90f);
+    c[ImGuiCol_TabActive]            = ImVec4(0.28f, 0.24f, 0.10f, 1.00f);
+    c[ImGuiCol_TabUnfocused]         = ImVec4(0.10f, 0.09f, 0.07f, 0.97f);
+    c[ImGuiCol_TabUnfocusedActive]   = ImVec4(0.18f, 0.16f, 0.10f, 1.00f);
+
+    // Text
+    c[ImGuiCol_Text]                 = ImVec4(0.90f, 0.87f, 0.78f, 1.00f);
+    c[ImGuiCol_TextDisabled]         = ImVec4(0.50f, 0.47f, 0.40f, 1.00f);
+
+    // Modal dim background
+    c[ImGuiCol_ModalWindowDimBg]     = ImVec4(0.00f, 0.00f, 0.00f, 0.60f);
+
+    // Nav highlight
+    c[ImGuiCol_NavHighlight]         = ImVec4(0.70f, 0.58f, 0.20f, 1.00f);
+
+    // Table
+    c[ImGuiCol_TableHeaderBg]        = ImVec4(0.14f, 0.13f, 0.10f, 1.00f);
+    c[ImGuiCol_TableBorderStrong]    = ImVec4(0.28f, 0.25f, 0.18f, 0.60f);
+    c[ImGuiCol_TableBorderLight]     = ImVec4(0.22f, 0.20f, 0.15f, 0.40f);
+    c[ImGuiCol_TableRowBg]           = ImVec4(0.00f, 0.00f, 0.00f, 0.00f);
+    c[ImGuiCol_TableRowBgAlt]        = ImVec4(0.10f, 0.10f, 0.08f, 0.30f);
+
+    // Plot (progress bars)
+    c[ImGuiCol_PlotHistogram]        = ImVec4(0.65f, 0.55f, 0.15f, 1.00f);
+    c[ImGuiCol_PlotHistogramHovered] = ImVec4(0.80f, 0.68f, 0.20f, 1.00f);
+}
+
 // --- Addon Lifecycle ---
 
 void AddonLoad(AddonAPI_t* aApi) {
@@ -2320,6 +2462,8 @@ void AddonLoad(AddonAPI_t* aApi) {
     ImGui::SetCurrentContext((ImGuiContext*)APIDefs->ImguiContext);
     ImGui::SetAllocatorFunctions((void* (*)(size_t, void*))APIDefs->ImguiMalloc,
                                  (void(*)(void*, void*))APIDefs->ImguiFree);
+
+    BuildGW2Theme();
 
     // Initialize subsystems
     FlipOut::IconManager::Initialize(APIDefs);
@@ -2333,6 +2477,7 @@ void AddonLoad(AddonAPI_t* aApi) {
         FlipOut::TPAPI::LoadRecipeCache();
         FlipOut::PriceDB::Load();
         FlipOut::PriceDB::LoadWatchlist();
+        FlipOut::HoardBridge::LoadSession();
         TryDownloadSeed();
         g_DataLoading = false;
         g_DataLoaded = true;
@@ -2429,6 +2574,8 @@ void AddonRender() {
 
     if (!g_WindowVisible) return;
 
+    PushGW2Theme();
+
     // On first window open, request Hoard & Seek permissions
     {
         static bool s_FirstOpenDone = false;
@@ -2443,6 +2590,7 @@ void AddonRender() {
         ImGuiWindowFlags_NoCollapse))
     {
         ImGui::End();
+        PopGW2Theme();
         return;
     }
 
@@ -2450,11 +2598,13 @@ void AddonRender() {
     if (g_DataLoading) {
         ImGui::TextColored(ImVec4(1.0f, 0.85f, 0.0f, 1.0f), "Loading data...");
         ImGui::End();
+        PopGW2Theme();
         return;
     }
 
     // Hoard & Seek connection status bar
     {
+        ImGui::AlignTextToFramePadding();
         auto hsStatus = FlipOut::HoardBridge::GetStatus();
         if (hsStatus == FlipOut::HoardStatus::Connected) {
             ImGui::TextColored(ImVec4(0.35f, 0.82f, 0.35f, 1.0f), "[Hoard & Seek: Connected]");
@@ -2467,6 +2617,39 @@ void AddonRender() {
                 FlipOut::HoardBridge::Ping();
             }
         }
+
+        // Account selector (only shown when multiple accounts exist)
+        if (!FlipOut::HoardBridge::IsSingleAccount() && hsStatus == FlipOut::HoardStatus::Connected) {
+            ImGui::SameLine();
+            ImGui::TextColored(ImVec4(0.5f, 0.5f, 0.5f, 1.0f), " | ");
+            ImGui::SameLine();
+            ImGui::TextColored(ImVec4(0.7f, 0.7f, 0.7f, 1.0f), "Account:");
+            ImGui::SameLine();
+
+            const auto& accounts = FlipOut::HoardBridge::GetAccounts();
+            int activeIdx = FlipOut::HoardBridge::GetActiveAccountIndex();
+
+            // Build preview text
+            const char* preview = (activeIdx >= 0 && activeIdx < (int)accounts.size())
+                ? accounts[activeIdx].display_name.c_str()
+                : "Auto-detect...";
+
+            ImGui::SetNextItemWidth(160);
+            if (ImGui::BeginCombo("##account_select", preview, ImGuiComboFlags_NoArrowButton)) {
+                for (int i = 0; i < (int)accounts.size(); i++) {
+                    bool selected = (i == activeIdx);
+                    if (ImGui::Selectable(accounts[i].display_name.c_str(), selected)) {
+                        FlipOut::HoardBridge::SetActiveAccount(i);
+                        // Reset per-tab state so they re-fetch for the new account
+                        g_CraftingRecipesQueried = false;
+                        g_CraftingIngredientsQueried = false;
+                    }
+                    if (selected) ImGui::SetItemDefaultFocus();
+                }
+                ImGui::EndCombo();
+            }
+        }
+
         ImGui::SameLine();
         ImGui::TextColored(ImVec4(0.5f, 0.5f, 0.5f, 1.0f), " | ");
         ImGui::SameLine();
@@ -2519,11 +2702,14 @@ void AddonRender() {
 
     // Price history window (rendered outside the main window)
     RenderPriceHistoryWindow();
+
+    PopGW2Theme();
 }
 
 // --- Options/Settings Render ---
 
 void AddonOptions() {
+    PushGW2Theme();
     ImGui::Text("Flip Out Settings");
     if (ImGui::SmallButton("Homepage")) {
         ShellExecuteA(NULL, "open", "https://pie.rocks.cc/", NULL, NULL, SW_SHOWNORMAL);
@@ -2602,6 +2788,7 @@ void AddonOptions() {
     }
     ImGui::SameLine();
     ImGui::Text("Tracking %d items", (int)FlipOut::PriceDB::GetTrackedItemCount());
+    PopGW2Theme();
 }
 
 // --- Export: GetAddonDef ---

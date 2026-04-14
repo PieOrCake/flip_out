@@ -19,7 +19,8 @@ namespace FlipOut {
         ItemQuery,
         RecipeUnlock,
         TransactionBuys,
-        TransactionSells
+        TransactionSells,
+        AccountQuery
     };
 
     struct PendingRetry {
@@ -46,6 +47,16 @@ namespace FlipOut {
         std::string type;
         int32_t total_count = 0;
         std::vector<std::pair<std::string, int32_t>> locations; // location name -> count
+    };
+
+    // Account info from H&S
+    struct AccountInfo {
+        std::string account_name;   // e.g. "PieOrCake.7635"
+        std::string label;          // user-assigned friendly name
+        std::string display_name;   // label if set, else account_name
+        int64_t last_updated = 0;
+        bool validated = false;
+        std::vector<std::string> characters;
     };
 
     class HoardBridge {
@@ -95,6 +106,20 @@ namespace FlipOut {
         static bool IsPermissionPending();
         static bool IsPermissionDenied();
 
+        // --- Multi-account ---
+        static const std::vector<AccountInfo>& GetAccounts();
+        static const std::string& GetActiveAccountName();
+        static const std::string& GetActiveAccountDisplay();
+        static void SetActiveAccount(int index);
+        static int GetActiveAccountIndex();
+        static uint32_t GetAccountCount();
+        static bool IsSingleAccount();
+        static void QueryAccounts();
+
+        // Session persistence (selected account)
+        static void SaveSession();
+        static void LoadSession();
+
         // Get owned item data (populated by QueryItem responses)
         static const OwnedItem* GetOwnedItem(uint32_t item_id);
         static std::unordered_map<uint32_t, OwnedItem> GetAllOwnedItems();
@@ -120,6 +145,8 @@ namespace FlipOut {
         static void OnDataUpdated(void* eventArgs);
         static void OnFetchProgress(void* eventArgs);
         static void OnFetchError(void* eventArgs);
+        static void OnAccountsChanged(void* eventArgs);
+        static void OnMumbleIdentityUpdated(void* eventArgs);
 
         // Event handlers (query responses — MUST delete payloads)
         static void OnItemQueryResponse(void* eventArgs);
@@ -127,6 +154,7 @@ namespace FlipOut {
         static void OnTxBuysResponse(void* eventArgs);
         static void OnTxSellsResponse(void* eventArgs);
         static void OnRecipeQueryResponse(void* eventArgs);
+        static void OnAccountsQueryResponse(void* eventArgs);
 
         // Context menu callback (MUST delete payload)
         static void OnContextMenuWatch(void* eventArgs);
@@ -134,6 +162,9 @@ namespace FlipOut {
         // Discard handlers for dummy permission-check queries
         static void OnPermCheckDiscard(void* eventArgs);
         static void OnPermCheckDiscardItem(void* eventArgs);
+
+        // Resolve character name to account
+        static void ResolveCurrentAccount();
 
         static AddonAPI_t* s_API;
 
@@ -143,6 +174,17 @@ namespace FlipOut {
         static bool s_refreshNeeded;
         static int64_t s_lastUpdated;
         static int64_t s_refreshAvailableAt;
+        static uint32_t s_accountCount;
+
+        // Multi-account state
+        static std::vector<AccountInfo> s_accounts;
+        static int s_activeAccountIndex;
+        static std::string s_activeAccountName;
+        static std::string s_activeAccountDisplay;
+        static std::unordered_map<std::string, std::string> s_charToAccount; // char name -> account_name
+        static std::string s_currentCharacterName;
+        static bool s_accountsQueried;
+        static std::string s_savedAccountName; // loaded from session file
 
         // Fetch progress
         static bool s_hoardFetching;
@@ -186,6 +228,9 @@ namespace FlipOut {
         static std::function<void(const std::string&)> s_apiCallback;
 
         static std::mutex s_mutex;
+
+        // Clear per-account caches when switching accounts
+        static void ClearAccountCaches();
     };
 
 }

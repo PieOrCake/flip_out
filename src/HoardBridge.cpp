@@ -2,6 +2,7 @@
 #include "PriceDB.h"
 
 #include <cstring>
+#include <fstream>
 #include <nlohmann/json.hpp>
 
 using json = nlohmann::json;
@@ -18,6 +19,7 @@ namespace FlipOut {
     #define EV_FO_RECIPE_RESPONSE   "EV_FLIPOUT_RECIPE_RESPONSE"
     #define EV_FO_PERM_DISCARD      "EV_FLIPOUT_PERM_CHECK_DISCARD"
     #define EV_FO_PERM_DISCARD_ITEM "EV_FLIPOUT_PERM_CHECK_DISCARD_ITEM"
+    #define EV_FO_ACCOUNTS_RESPONSE "EV_FLIPOUT_ACCOUNTS_RESPONSE"
     #define FLIPOUT_SIGNATURE       0x1be8c2d6
 
     // Static member initialization
@@ -48,6 +50,15 @@ namespace FlipOut {
     int HoardBridge::s_recipeBatchesPending = 0;
     std::function<void(const std::string&)> HoardBridge::s_apiCallback;
     std::mutex HoardBridge::s_mutex;
+    uint32_t HoardBridge::s_accountCount = 0;
+    std::vector<AccountInfo> HoardBridge::s_accounts;
+    int HoardBridge::s_activeAccountIndex = -1;
+    std::string HoardBridge::s_activeAccountName;
+    std::string HoardBridge::s_activeAccountDisplay;
+    std::unordered_map<std::string, std::string> HoardBridge::s_charToAccount;
+    std::string HoardBridge::s_currentCharacterName;
+    bool HoardBridge::s_accountsQueried = false;
+    std::string HoardBridge::s_savedAccountName;
 
     // --- Lifecycle ---
 
@@ -76,6 +87,13 @@ namespace FlipOut {
         s_API->Events_Subscribe(EV_FO_PERM_DISCARD, OnPermCheckDiscard);
         s_API->Events_Subscribe(EV_FO_PERM_DISCARD_ITEM, OnPermCheckDiscardItem);
 
+        // Subscribe to accounts response and account change broadcasts
+        s_API->Events_Subscribe(EV_FO_ACCOUNTS_RESPONSE, OnAccountsQueryResponse);
+        s_API->Events_Subscribe(EV_HOARD_ACCOUNTS_CHANGED, OnAccountsChanged);
+
+        // Subscribe to MumbleLink identity for character→account mapping
+        s_API->Events_Subscribe("EV_MUMBLE_IDENTITY_UPDATED", OnMumbleIdentityUpdated);
+
         s_API->Log(LOGL_INFO, "FlipOut", "Subscribed to Hoard & Seek events");
 
         // Initial ping to detect H&S
@@ -100,6 +118,9 @@ namespace FlipOut {
         s_API->Events_Unsubscribe(EV_FO_CONTEXT_WATCH, OnContextMenuWatch);
         s_API->Events_Unsubscribe(EV_FO_PERM_DISCARD, OnPermCheckDiscard);
         s_API->Events_Unsubscribe(EV_FO_PERM_DISCARD_ITEM, OnPermCheckDiscardItem);
+        s_API->Events_Unsubscribe(EV_FO_ACCOUNTS_RESPONSE, OnAccountsQueryResponse);
+        s_API->Events_Unsubscribe(EV_HOARD_ACCOUNTS_CHANGED, OnAccountsChanged);
+        s_API->Events_Unsubscribe("EV_MUMBLE_IDENTITY_UPDATED", OnMumbleIdentityUpdated);
 
         // H&S auto-cleans by signature, but remove explicitly for good measure
         RemoveContextMenu();
@@ -126,7 +147,11 @@ namespace FlipOut {
         int key = static_cast<int>(type);
         int attempts = s_retryAttempts[key];
 
-        if (attempts >= RETRY_MAX) {
+        // Account queries get more retries since user may take time to approve permission
+        int maxRetries = (type == RetryType::AccountQuery) ? 10 : RETRY_MAX;
+        int delayMs = (type == RetryType::AccountQuery) ? 3000 : RETRY_DELAY_MS;
+
+        if (attempts >= maxRetries) {
             if (s_API) {
                 s_API->Log(LOGL_WARNING, "FlipOut", "H&S query max retries reached, giving up");
             }
@@ -142,11 +167,11 @@ namespace FlipOut {
         retry.type = type;
         retry.ids = ids;
         retry.attempts = attempts + 1;
-        retry.retry_at = std::chrono::steady_clock::now() + std::chrono::milliseconds(RETRY_DELAY_MS);
+        retry.retry_at = std::chrono::steady_clock::now() + std::chrono::milliseconds(delayMs);
         s_retryQueue.push_back(std::move(retry));
 
         if (s_API) {
-            std::string msg = "H&S permission pending, retry " + std::to_string(attempts + 1) + "/" + std::to_string(RETRY_MAX) + " in 2s";
+            std::string msg = "H&S permission pending, retry " + std::to_string(attempts + 1) + "/" + std::to_string(maxRetries) + " in " + std::to_string(delayMs / 1000) + "s";
             s_API->Log(LOGL_INFO, "FlipOut", msg.c_str());
         }
     }
@@ -213,6 +238,13 @@ namespace FlipOut {
                 }
                 FetchTransactions();
                 break;
+
+            case RetryType::AccountQuery:
+                if (s_API) {
+                    s_API->Log(LOGL_INFO, "FlipOut", "Retrying H&S accounts query after permission granted");
+                }
+                QueryAccounts();
+                break;
             }
         }
     }
@@ -243,6 +275,9 @@ namespace FlipOut {
         strncpy(req.requester, REQUESTER_NAME, sizeof(req.requester));
         req.item_id = item_id;
         strncpy(req.response_event, EV_FO_ITEM_RESPONSE, sizeof(req.response_event));
+        if (!s_activeAccountName.empty() && s_accountCount > 1) {
+            strncpy(req.account_filter, s_activeAccountName.c_str(), sizeof(req.account_filter));
+        }
 
         s_API->Events_Raise(EV_HOARD_QUERY_ITEM, &req);
     }
@@ -269,6 +304,9 @@ namespace FlipOut {
         strncpy(req.requester, REQUESTER_NAME, sizeof(req.requester));
         strncpy(req.endpoint, endpoint.c_str(), sizeof(req.endpoint));
         strncpy(req.response_event, EV_FO_API_RESPONSE, sizeof(req.response_event));
+        if (!s_activeAccountName.empty() && s_accountCount > 1) {
+            strncpy(req.account_name, s_activeAccountName.c_str(), sizeof(req.account_name));
+        }
 
         s_API->Events_Raise(EV_HOARD_QUERY_API, &req);
     }
@@ -299,6 +337,9 @@ namespace FlipOut {
             req.api_version = HOARD_API_VERSION;
             strncpy(req.requester, REQUESTER_NAME, sizeof(req.requester));
             strncpy(req.response_event, EV_FO_RECIPE_RESPONSE, sizeof(req.response_event));
+            if (!s_activeAccountName.empty() && s_accountCount > 1) {
+                strncpy(req.account_name, s_activeAccountName.c_str(), sizeof(req.account_name));
+            }
 
             size_t end = std::min(i + BATCH, to_query.size());
             req.id_count = (uint32_t)(end - i);
@@ -483,6 +524,9 @@ namespace FlipOut {
             strncpy(req.requester, REQUESTER_NAME, sizeof(req.requester));
             strncpy(req.endpoint, "/v2/commerce/transactions/current/buys", sizeof(req.endpoint));
             strncpy(req.response_event, EV_FO_TX_BUYS_RESPONSE, sizeof(req.response_event));
+            if (!s_activeAccountName.empty() && s_accountCount > 1) {
+                strncpy(req.account_name, s_activeAccountName.c_str(), sizeof(req.account_name));
+            }
             s_API->Events_Raise(EV_HOARD_QUERY_API, &req);
         }
 
@@ -493,6 +537,9 @@ namespace FlipOut {
             strncpy(req.requester, REQUESTER_NAME, sizeof(req.requester));
             strncpy(req.endpoint, "/v2/commerce/transactions/current/sells", sizeof(req.endpoint));
             strncpy(req.response_event, EV_FO_TX_SELLS_RESPONSE, sizeof(req.response_event));
+            if (!s_activeAccountName.empty() && s_accountCount > 1) {
+                strncpy(req.account_name, s_activeAccountName.c_str(), sizeof(req.account_name));
+            }
             s_API->Events_Raise(EV_HOARD_QUERY_API, &req);
         }
     }
@@ -568,17 +615,24 @@ namespace FlipOut {
 
         if (!eventArgs) return; // Backward compat with older H&S
         HoardPongPayload* pong = static_cast<HoardPongPayload*>(eventArgs);
-        if (pong->api_version != HOARD_API_VERSION) return;
+        if (pong->api_version < 3) return;
 
         s_lastUpdated = pong->last_updated;
         s_refreshAvailableAt = pong->refresh_available_at;
+        s_accountCount = pong->account_count;
         if (pong->has_data) {
             s_hoardDataAvailable = true;
             s_refreshNeeded = true;
         }
 
+        // Query account list if multi-account and not yet queried
+        if (s_accountCount > 1 && !s_accountsQueried) {
+            QueryAccounts();
+        }
+
         if (s_API) {
-            std::string msg = std::string("Connected to Hoard & Seek (data=") + (pong->has_data ? "yes" : "no") + ")";
+            std::string msg = std::string("Connected to Hoard & Seek (data=") + (pong->has_data ? "yes" : "no")
+                + ", accounts=" + std::to_string(s_accountCount) + ")";
             s_API->Log(LOGL_INFO, "FlipOut", msg.c_str());
         }
         // Do NOT delete — payload is stack-allocated by H&S
@@ -587,9 +641,10 @@ namespace FlipOut {
     void HoardBridge::OnDataUpdated(void* eventArgs) {
         if (eventArgs) {
             HoardDataReadyPayload* payload = static_cast<HoardDataReadyPayload*>(eventArgs);
-            if (payload->api_version == HOARD_API_VERSION) {
+            if (payload->api_version >= 3) {
                 s_lastUpdated = payload->last_updated;
                 s_refreshAvailableAt = payload->refresh_available_at;
+                s_accountCount = payload->account_count;
             }
         }
         s_hoardDetected = true;
@@ -599,16 +654,16 @@ namespace FlipOut {
         s_fetchProgressMsg.clear();
 
         // Clear old cached data so it gets re-queried
-        s_ownedItems.clear();
-        s_queriedItems.clear();
-        s_unlockedRecipes.clear();
-        s_queriedRecipes.clear();
-        s_recipeQueryDone = false;
-        s_recipeBatchesPending = 0;
+        ClearAccountCaches();
         s_retryQueue.clear();
         s_retryAttempts.clear();
         s_permissionPending = false;
         s_permissionDenied = false;
+
+        // Re-query accounts if multi-account
+        if (s_accountCount > 1) {
+            QueryAccounts();
+        }
 
         if (s_API) {
             s_API->Log(LOGL_INFO, "FlipOut", "H&S data updated, caches cleared");
@@ -671,7 +726,7 @@ namespace FlipOut {
         item.type = std::string(resp->type);
         item.total_count = resp->total_count;
 
-        for (uint32_t i = 0; i < resp->location_count && i < 32; i++) {
+        for (uint32_t i = 0; i < resp->location_count && i < 64; i++) {
             std::string loc = std::string(resp->locations[i].location);
             if (resp->locations[i].sublocation[0] != '\0') {
                 loc += " > " + std::string(resp->locations[i].sublocation);
@@ -870,6 +925,262 @@ namespace FlipOut {
         }
 
         delete resp;
+    }
+
+    // --- Multi-account: Query & Accessors ---
+
+    void HoardBridge::QueryAccounts() {
+        if (!s_API) return;
+
+        HoardQueryAccountsRequest req{};
+        req.api_version = HOARD_API_VERSION;
+        strncpy(req.requester, REQUESTER_NAME, sizeof(req.requester));
+        strncpy(req.response_event, EV_FO_ACCOUNTS_RESPONSE, sizeof(req.response_event));
+
+        s_API->Events_Raise(EV_HOARD_QUERY_ACCOUNTS, &req);
+    }
+
+    const std::vector<AccountInfo>& HoardBridge::GetAccounts() {
+        return s_accounts;
+    }
+
+    const std::string& HoardBridge::GetActiveAccountName() {
+        return s_activeAccountName;
+    }
+
+    const std::string& HoardBridge::GetActiveAccountDisplay() {
+        return s_activeAccountDisplay;
+    }
+
+    int HoardBridge::GetActiveAccountIndex() {
+        return s_activeAccountIndex;
+    }
+
+    uint32_t HoardBridge::GetAccountCount() {
+        return s_accountCount;
+    }
+
+    bool HoardBridge::IsSingleAccount() {
+        return s_accountCount <= 1;
+    }
+
+    void HoardBridge::SetActiveAccount(int index) {
+        std::lock_guard<std::mutex> lock(s_mutex);
+        if (index < 0 || index >= (int)s_accounts.size()) return;
+        if (index == s_activeAccountIndex) return;
+
+        s_activeAccountIndex = index;
+        s_activeAccountName = s_accounts[index].account_name;
+        s_activeAccountDisplay = s_accounts[index].display_name;
+
+        if (s_API) {
+            std::string msg = "Switched active account to: " + s_activeAccountDisplay;
+            s_API->Log(LOGL_INFO, "FlipOut", msg.c_str());
+        }
+
+        // Persist the selection
+        s_savedAccountName = s_activeAccountName;
+        SaveSession();
+
+        // Clear per-account caches so data is re-queried for the new account
+        s_ownedItems.clear();
+        s_queriedItems.clear();
+        s_unlockedRecipes.clear();
+        s_queriedRecipes.clear();
+        s_recipeQueryDone = false;
+        s_recipeBatchesPending = 0;
+        s_txLoaded = false;
+        s_txLoading = false;
+        s_txBuysReceived = false;
+        s_txSellsReceived = false;
+        s_currentBuys.clear();
+        s_currentSells.clear();
+    }
+
+    void HoardBridge::ClearAccountCaches() {
+        s_ownedItems.clear();
+        s_queriedItems.clear();
+        s_unlockedRecipes.clear();
+        s_queriedRecipes.clear();
+        s_recipeQueryDone = false;
+        s_recipeBatchesPending = 0;
+    }
+
+    void HoardBridge::ResolveCurrentAccount() {
+        if (s_currentCharacterName.empty()) return;
+        if (s_charToAccount.empty()) return;
+
+        auto it = s_charToAccount.find(s_currentCharacterName);
+        if (it == s_charToAccount.end()) return;
+
+        const std::string& accountName = it->second;
+
+        // Find the account index and auto-select if no account is active yet
+        for (int i = 0; i < (int)s_accounts.size(); i++) {
+            if (s_accounts[i].account_name == accountName) {
+                if (s_activeAccountIndex < 0) {
+                    // No account selected yet — auto-select the logged-in one
+                    s_activeAccountIndex = i;
+                    s_activeAccountName = s_accounts[i].account_name;
+                    s_activeAccountDisplay = s_accounts[i].display_name;
+                    if (s_API) {
+                        std::string msg = "Auto-detected account: " + s_activeAccountDisplay
+                            + " (character: " + s_currentCharacterName + ")";
+                        s_API->Log(LOGL_INFO, "FlipOut", msg.c_str());
+                    }
+                }
+                break;
+            }
+        }
+    }
+
+    // --- Event Handlers: Account management ---
+
+    void HoardBridge::OnAccountsQueryResponse(void* eventArgs) {
+        if (!eventArgs) return;
+        HoardQueryAccountsResponse* resp = static_cast<HoardQueryAccountsResponse*>(eventArgs);
+
+        if (resp->api_version != HOARD_API_VERSION) { delete resp; return; }
+
+        if (resp->status == HOARD_STATUS_PENDING) {
+            s_permissionPending = true;
+            ScheduleRetry(RetryType::AccountQuery, {});
+            delete resp;
+            return;
+        }
+        if (resp->status == HOARD_STATUS_DENIED) {
+            s_permissionDenied = true;
+            delete resp;
+            return;
+        }
+
+        s_permissionPending = false;
+        ResetRetryCount(RetryType::AccountQuery);
+        s_accountsQueried = true;
+
+        {
+            std::lock_guard<std::mutex> lock(s_mutex);
+            s_accounts.clear();
+            s_charToAccount.clear();
+
+            for (uint32_t i = 0; i < resp->account_count && i < 16; i++) {
+                AccountInfo acct;
+                acct.account_name = resp->accounts[i].account_name;
+                acct.label = resp->accounts[i].label;
+                acct.display_name = (acct.label.empty()) ? acct.account_name : acct.label;
+                acct.last_updated = resp->accounts[i].last_updated;
+                acct.validated = (resp->accounts[i].validated != 0);
+
+                for (uint32_t c = 0; c < resp->accounts[i].character_count && c < 80; c++) {
+                    std::string charName(resp->accounts[i].characters[c]);
+                    if (!charName.empty()) {
+                        acct.characters.push_back(charName);
+                        s_charToAccount[charName] = acct.account_name;
+                    }
+                }
+
+                s_accounts.push_back(std::move(acct));
+            }
+
+            // If active account was set before, try to preserve it
+            if (s_activeAccountIndex >= 0 && s_activeAccountIndex < (int)s_accounts.size()) {
+                // Verify it still matches
+                if (s_accounts[s_activeAccountIndex].account_name != s_activeAccountName) {
+                    s_activeAccountIndex = -1;
+                    s_activeAccountName.clear();
+                    s_activeAccountDisplay.clear();
+                }
+            } else {
+                s_activeAccountIndex = -1;
+                s_activeAccountName.clear();
+                s_activeAccountDisplay.clear();
+            }
+        }
+
+        // Try to restore saved account preference first
+        if (s_activeAccountIndex < 0 && !s_savedAccountName.empty()) {
+            for (int i = 0; i < (int)s_accounts.size(); i++) {
+                if (s_accounts[i].account_name == s_savedAccountName) {
+                    s_activeAccountIndex = i;
+                    s_activeAccountName = s_accounts[i].account_name;
+                    s_activeAccountDisplay = s_accounts[i].display_name;
+                    if (s_API) {
+                        std::string msg = "Restored saved account: " + s_activeAccountDisplay;
+                        s_API->Log(LOGL_INFO, "FlipOut", msg.c_str());
+                    }
+                    break;
+                }
+            }
+        }
+
+        // If still no active account, try to auto-detect from current character
+        ResolveCurrentAccount();
+
+        if (s_API) {
+            std::string msg = "Received " + std::to_string(s_accounts.size()) + " accounts from H&S";
+            s_API->Log(LOGL_INFO, "FlipOut", msg.c_str());
+        }
+
+        delete resp;
+    }
+
+    void HoardBridge::OnAccountsChanged(void* /*eventArgs*/) {
+        // Accounts were added/removed in H&S — re-query the list
+        s_accountsQueried = false;
+        QueryAccounts();
+        if (s_API) {
+            s_API->Log(LOGL_INFO, "FlipOut", "H&S accounts changed, re-querying");
+        }
+        // Do NOT delete — payload is nullptr
+    }
+
+    void HoardBridge::OnMumbleIdentityUpdated(void* eventArgs) {
+        if (!eventArgs) return;
+
+        // eventArgs is Mumble::Identity* — read character name
+        // Mumble::Identity has Name as first field (wchar_t[20] or char[20] depending on build)
+        // Per the migration guide, read as raw bytes and validate
+        char buf[20] = {};
+        memcpy(buf, eventArgs, 19);
+        std::string charName(buf);
+
+        // Validate: GW2 character names contain only letters, spaces, hyphens, accented chars
+        for (unsigned char c : charName) {
+            if (c == ' ' || c == '-' || isalpha(c) || c >= 0x80) continue;
+            return; // invalid — likely garbage data
+        }
+        if (charName.empty()) return;
+
+        s_currentCharacterName = charName;
+        ResolveCurrentAccount();
+    }
+
+    // --- Session Persistence ---
+
+    void HoardBridge::SaveSession() {
+        try {
+            std::string path = TPAPI::GetDataDirectory() + "/session.json";
+            json j;
+            j["active_account"] = s_savedAccountName;
+            std::ofstream file(path);
+            if (file.is_open()) {
+                file << j.dump();
+                file.flush();
+            }
+        } catch (...) {}
+    }
+
+    void HoardBridge::LoadSession() {
+        try {
+            std::string path = TPAPI::GetDataDirectory() + "/session.json";
+            std::ifstream file(path);
+            if (!file.is_open()) return;
+            json j;
+            file >> j;
+            if (j.contains("active_account") && j["active_account"].is_string()) {
+                s_savedAccountName = j["active_account"].get<std::string>();
+            }
+        } catch (...) {}
     }
 
 }
