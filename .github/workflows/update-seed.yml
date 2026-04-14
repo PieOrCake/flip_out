@@ -1,0 +1,56 @@
+name: Update Price Seed
+
+on:
+  schedule:
+    - cron: '0 */6 * * *'  # every 6 hours
+  workflow_dispatch:        # manual trigger
+
+permissions:
+  contents: write
+
+jobs:
+  update-seed:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Download existing seed from release
+        id: download
+        run: |
+          # Try to download the existing seed asset; if it doesn't exist yet, skip
+          if gh release download seed-latest -p seed_prices.json -D /tmp 2>/dev/null; then
+            echo "existing=true" >> "$GITHUB_OUTPUT"
+            echo "Downloaded existing seed"
+          else
+            echo "existing=false" >> "$GITHUB_OUTPUT"
+            echo "No existing seed found, starting fresh"
+          fi
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Fetch prices and merge seed
+        run: |
+          if [ "${{ steps.download.outputs.existing }}" = "true" ]; then
+            python scripts/update_seed.py --existing /tmp/seed_prices.json --output /tmp/seed_prices_new.json
+          else
+            python scripts/update_seed.py --output /tmp/seed_prices_new.json
+          fi
+          mv /tmp/seed_prices_new.json /tmp/seed_prices.json
+
+      - name: Create or update release
+        run: |
+          # Create the release if it doesn't exist
+          if ! gh release view seed-latest >/dev/null 2>&1; then
+            gh release create seed-latest \
+              --title "Price Seed Data" \
+              --notes "Auto-updated price seed data for new Flip Out installs. Updated every 6 hours." \
+              --latest=false
+          fi
+          # Upload (overwrite) the seed asset
+          gh release upload seed-latest /tmp/seed_prices.json --clobber
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

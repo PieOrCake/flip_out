@@ -176,7 +176,7 @@ void ProcessKeybind(const char* aIdentifier, bool aIsRelease);
 void AddonRender();
 void AddonOptions();
 
-static const char* SEED_URL = "https://raw.githubusercontent.com/PieOrCake/flip_out/main/data/seed_prices.json";
+static const char* SEED_URL = "https://github.com/PieOrCake/flip_out/releases/download/seed-latest/seed_prices.json";
 
 static void TryDownloadSeed() {
     if (g_SeedDownloaded) return;
