@@ -1,4 +1,4 @@
-name: Update Price Seed
+name: Update Price Seed & Items Index
 
 on:
   schedule:
@@ -41,16 +41,20 @@ jobs:
           fi
           mv /tmp/seed_prices_new.json /tmp/seed_prices.json
 
+      - name: Build tradeable items index
+        run: python scripts/update_items_index.py --output /tmp/tradeable_items.json
+
       - name: Create or update release
         run: |
           # Create the release if it doesn't exist
           if ! gh release view seed-latest >/dev/null 2>&1; then
             gh release create seed-latest \
               --title "Price Seed Data" \
-              --notes "Auto-updated price seed data for new Flip Out installs. Updated every 6 hours." \
+              --notes "Auto-updated seed data for Flip Out and Alter Ego. Updated every 6 hours." \
               --latest=false
           fi
-          # Upload (overwrite) the seed asset
+          # Upload (overwrite) both assets
           gh release upload seed-latest /tmp/seed_prices.json --clobber
+          gh release upload seed-latest /tmp/tradeable_items.json --clobber
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
