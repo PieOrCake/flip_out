@@ -2,15 +2,14 @@
 
 A Guild Wars 2 addon for the [Nexus](https://raidcore.gg/Nexus) framework that tracks Trading Post market trends and helps you find profitable flips.
 
-This project is still in development and testing.
-
-![Flip Out main window](screenshots/main_window.png)
+![Flips Tab](screenshots/flips.png)
 ![Crafting tab](screenshots/crafting.png)
 ![Liquidate tab](screenshots/liquidate.png)
+![Price History Dialog](screenshots/history.png)
 
 ## AI Notice
 
-This addon has been 100% created in [Windsurf](https://windsurf.com/) using Claude. I understand that some folks have a moral, financial or political objection to creating software using an LLM. I just wanted to make a useful tool for the GW2 community, and this was the only way I could do it.
+This addon has been largely created using Claude. I understand that some folks have a moral, financial or political objection to creating software using an LLM. I just wanted to make a useful tool for the GW2 community, and this was the only way I could do it.
 
 If an LLM creating software upsets you, then perhaps this repo isn't for you. Move on, and enjoy your day.
 
@@ -19,77 +18,69 @@ If an LLM creating software upsets you, then perhaps this repo isn't for you. Mo
 ### Flips Tab
 
 - **Flip Scanner** — Scans all tradeable items via the public GW2 API and ranks them by profit, margin, ROI, or volume
-- **Scan Cooldown** — 10-minute minimum between scans to avoid excessive API usage
-- **Last Scan Timestamp** — Shows how long ago the last scan completed
 - **Outlier Detection** — Filters manipulated prices to prevent skewed recommendations
-- **Sell Opportunities** — Surfaces items you own that are currently selling above their historical average (requires [Hoard & Seek](https://github.com/PieOrCake/hoard_and_seek))
-- **Market Movers** — Detects items with significant price or volume spikes compared to their historical averages, ranked by spike intensity
-- **Owned Item Highlighting** — Items you own are highlighted with a gold tint and owned count in both the Flips and Market Movers tables (requires Hoard & Seek)
+- **Owned Item Highlighting** — Items you own are highlighted with a gold tint and owned count
+
+### Market Movers Tab
+
+- **Price Spike Detection** — Detects items with significant price or volume spikes vs their historical average, ranked by spike intensity
+- **Owned Item Highlighting** — Items you own are highlighted
 
 ### Crafting Tab
 
-- **Crafting Profit Calculator** — Fetches all recipes from the GW2 API and calculates profit per craft based on ingredient buy prices and output sell prices
-- **Crafting Modes** — Fastest (instant buy ingredients, instant sell output), Balanced (instant buy, list output), Patient (list buy, list output)
-- **Known Recipes Filter** — Optionally show only recipes your account has unlocked (requires Hoard & Seek)
-- **Ingredient Tooltips** — Hover over a recipe to see ingredient details, including owned counts and cost savings from materials you already have
-- **Sortable Columns** — Sort by profit, ROI, volume, or any other column
+- **Crafting Profit Calculator** — Fetches all recipes from the GW2 API and calculates profit per craft
+- **Crafting Modes** — Fastest (instant buy/sell), Balanced (instant buy, list sell), Patient (list buy/sell)
+- **Known Recipes Filter** — Show only recipes your account has unlocked (requires Hoard & Seek)
+- **Ingredient Tooltips** — Hover a recipe to see ingredient details and cost savings from materials you already own
 
 ### Liquidate Tab
 
-- **Owned Item Valuation** — Shows the top 50 most valuable tradeable items you own across all storage locations
-- **Instant & Listed Totals** — Both values include the 15% TP tax for accurate comparison
-- **Smart Filtering** — Excludes Legendary Armory and equipped items that can't be sold
-- **Quick Gold Decisions** — Sorted by instant sell value to help you find fast gold
-- **Requires Hoard & Seek** — Queries H&S's local account cache for owned item data
+- **Owned Item Valuation** — Top 50 most valuable tradeable items you own across all storage, sorted by instant sell value
+- **Instant & Listed Totals** — Both values include the 15% TP tax
+- **Requires Hoard & Seek**
 
 ### Watchlist Tab
 
-- **Watchlist** — Track specific items over time with configurable price alerts
+- **Price Tracking** — Track specific items over time with configurable price alerts
 - **Trend Analysis** — Linear regression on price history to detect rising, falling, or stable trends
-- **Auto-Refresh** — Watchlist prices update automatically on a configurable interval
+- **Auto-Refresh** — Watchlist prices update on a configurable interval
 
 ### Transactions Tab
 
-- **Transaction Viewer** — View your pending buy orders and sell listings (requires Hoard & Seek for authenticated API access)
+- **Pending Orders** — View your active buy orders and sell listings
 
 ### Search Tab
 
 - **Item Search** — Search the item cache by name with live prices, margin, profit, and owned count
-- **Owned Count** — Shows how many of each item you own across all storage locations (requires Hoard & Seek)
 
 ### Price History
 
-- **Price History Graph** — Right-click any item to view a detailed price history graph in a separate window
-- **Time Ranges** — Switch between 1 day, 1 week, 1 month, 3 months, and 6 months of history
-- **Buy/Sell Lines** — Dual-line chart showing both buy and sell price trends over time
+- **Price Graph** — Right-click any item to view a price history graph; switch between 1d, 1w, 1m, 3m, and 6m ranges
 
 ### General
 
-- **Colored Coin Display** — Gold, silver, and copper values are color-coded for easy reading
-- **Right-Click Context Menus** — Right-click any item row to add/remove from watchlist, search in Hoard & Seek, or view price history
-- **Item Icons** — Async icon downloading from the GW2 render API with texture caching
-- **Quick Access Toggle** — Show or hide the Quick Access bar icon from settings
-- **Persistent Storage** — Price history, watchlist, item cache, and config saved to disk as JSON
-- **Community Seed Data** — New users automatically download community price history from this repo so features like Market Movers and Sell Opportunities work immediately
+- **Right-Click Context Menus** — Add/remove watchlist, search in Hoard & Seek, view price history
+- **Persistent Storage** — Price history, watchlist, item cache, and config saved as JSON
+- **Community Seed Data** — New installs automatically download ~1 month of community price history so Market Movers works immediately
 
 ## Hoard & Seek Integration
 
 Flip Out integrates with [Hoard & Seek](https://github.com/PieOrCake/hoard_and_seek) via Nexus events for:
 
-- **Owned item data** — Know which flip candidates and market movers you already own
-- **Account search** — Search your account storage directly from item context menus
-- **Authenticated API calls** — Transaction data (pending buys/sells) via H&S's API key
-- **Crafting unlocks** — Filter crafting recipes to only those your account has unlocked
-- **Liquidate tab** — Full inventory valuation using H&S's local account cache
+- Owned item counts in Flips, Market Movers, Crafting, and Search
+- Account storage search from item context menus
+- Authenticated API access for Transactions
+- Crafting recipe unlock filtering
+- Full inventory valuation for Liquidate
 
-Flip Out works without Hoard & Seek, but Sell Opportunities, owned item highlighting, Crafting unlock filtering, Liquidate, and Transactions features will be unavailable.
+Flip Out works without Hoard & Seek, but owned item data, Liquidate, Transactions, and crafting unlock filtering will be unavailable.
 
 ## Requirements
 
-- Guild Wars 2 with [Nexus addon loader](https://raidcore.gg/Nexus) installed
-- Optional: [Hoard & Seek](https://github.com/PieOrCake/hoard_and_seek) addon for owned item data and transactions
+- Guild Wars 2 with [Nexus addon loader](https://raidcore.gg/Nexus)
+- Optional: [Hoard & Seek](https://github.com/PieOrCake/hoard_and_seek) for owned item data and transactions
 
-No API key is required — Flip Out uses only public GW2 API endpoints for price data.
+No API key required — Flip Out uses only public GW2 API endpoints for price data.
 
 ## Building
 
@@ -112,7 +103,7 @@ cmake ..
 make -j$(nproc)
 ```
 
-The output `FlipOut.dll` will be in the `build/` directory.
+Output: `build/FlipOut.dll`
 
 ### Installation
 
@@ -124,41 +115,38 @@ Copy `FlipOut.dll` to your GW2 Nexus addons directory:
 ## Usage
 
 1. Open the addon with **Ctrl+Shift+T** or via the Nexus quick access bar
-2. Click **Scan Market** on the Flips tab to fetch current prices
+2. Click **Scan Market** in the toolbar to fetch current prices
 3. Browse flip opportunities in the **Flips** tab
-4. Check the **Sell Opportunities** and **Market Movers** sections for items you own or items that are spiking
-5. Check the **Crafting** tab for profitable recipes to craft
-6. Check the **Liquidate** tab to see which owned items are worth selling
-7. Right-click any item to add it to your **Watchlist**, search in Hoard & Seek, or view its **Price History**
-8. Check the **Transactions** tab to see your pending orders (requires Hoard & Seek)
+4. Check **Market Movers** for items with recent price spikes
+5. Check **Crafting** for profitable recipes
+6. Check **Liquidate** to see which owned items are worth selling
+7. Right-click any item to add it to your **Watchlist** or view its **Price History**
+8. Check **Transactions** for your pending orders (requires Hoard & Seek)
 
 ## How Flips Work
 
-A "flip" is buying an item via buy order and reselling it via sell listing. The Trading Post charges:
-- **5% listing fee** (paid when you list)
-- **10% exchange fee** (paid when the item sells)
+A "flip" is buying via buy order and reselling via sell listing. The Trading Post charges:
+- **5% listing fee** (when you list)
+- **10% exchange fee** (when the item sells)
 
-Flip Out calculates profit after both fees:
 ```
-Profit = Sell Price - (5% of Sell) - (10% of Sell) - Buy Price
+Profit = Sell Price × 0.85 − Buy Price
 ```
 
 ## Community Seed Data
 
-The `data/seed_prices.json` file contains community-contributed price history. New users' addons automatically download this data on first load if their local history has fewer than 100 tracked items. This allows features like Market Movers and Sell Opportunities to work immediately without waiting days to build up personal history.
-
-The seed data is sourced from the public GW2 API. The Trading Post is global across all regions (NA/EU), so this data is accurate for everyone.
+New installs automatically download `seed_prices.json` from this repo's releases on first load (if fewer than 100 items are tracked locally). This gives Market Movers enough history to work immediately without waiting to build up personal data. The seed is sourced from the public GW2 API and is accurate for all regions.
 
 ## Architecture
 
 | File | Purpose |
 |------|---------|
 | `dllmain.cpp` | Nexus lifecycle, ImGui UI (tabs, tables, graphs, context menus) |
-| `TPAPI.h/cpp` | GW2 Trading Post API client (public endpoints: prices, listings, item info) |
+| `TPAPI.h/cpp` | GW2 Trading Post API client (prices, listings, item info) |
 | `PriceDB.h/cpp` | Price history storage, watchlist, seed import/export |
-| `Analyzer.h/cpp` | Flip detection, sell opportunities, market movers, crafting profits, outlier detection, trend analysis |
+| `Analyzer.h/cpp` | Flip detection, market movers, crafting profits, outlier detection, trend analysis |
 | `HoardBridge.h/cpp` | Cross-addon integration with Hoard & Seek via Nexus events |
-| `IconManager.h/cpp` | Async icon downloading and texture loading |
+| `IconManager.h/cpp` | Async icon downloading and texture caching |
 | `HttpClient.h/cpp` | WinINet HTTP client wrapper |
 
 ## License
@@ -172,4 +160,4 @@ MIT
 | [Dear ImGui](https://github.com/ocornut/imgui) | v1.80 | MIT | [License](https://github.com/ocornut/imgui/blob/master/LICENSE.txt) |
 | [nlohmann/json](https://github.com/nlohmann/json) | v3.11.3 | MIT | [License](https://github.com/nlohmann/json/blob/develop/LICENSE.MIT) |
 | [Nexus](https://raidcore.gg/Nexus) | API v6 | MIT | [License](https://github.com/RaidcoreGG/RCGG-lib-nexus-api/blob/main/LICENSE) |
-| [Hoard & Seek API](https://github.com/PieOrCake/hoard_and_seek) | v2 | MIT | [License](https://github.com/PieOrCake/hoard_and_seek/blob/main/LICENSE) |
+| [Hoard & Seek API](https://github.com/PieOrCake/hoard_and_seek) | v3 | MIT | [License](https://github.com/PieOrCake/hoard_and_seek/blob/main/LICENSE) |
