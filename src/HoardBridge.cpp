@@ -51,6 +51,7 @@ namespace FlipOut {
     std::function<void(const std::string&)> HoardBridge::s_apiCallback;
     std::mutex HoardBridge::s_mutex;
     uint32_t HoardBridge::s_accountCount = 0;
+    uint32_t HoardBridge::s_hoardVersion = 0;
     std::vector<AccountInfo> HoardBridge::s_accounts;
     int HoardBridge::s_activeAccountIndex = -1;
     std::string HoardBridge::s_activeAccountName;
@@ -59,6 +60,21 @@ namespace FlipOut {
     std::string HoardBridge::s_currentCharacterName;
     bool HoardBridge::s_accountsQueried = false;
     std::string HoardBridge::s_savedAccountName;
+
+    // Cap outgoing request version at whatever H&S advertised in pong, so an
+    // older H&S never gets a future version it would reject. Defaults to v3
+    // (the minimum we still support) until pong arrives.
+    uint32_t HoardBridge::OutgoingApiVersion() {
+        uint32_t v = s_hoardVersion ? s_hoardVersion : 3u;
+        if (v > HOARD_API_VERSION) v = HOARD_API_VERSION;
+        return v;
+    }
+
+    // v4-only fields live past the end of the v3 struct, so reading them when
+    // H&S is older than v4 is OOB. Gate via the version learned from pong.
+    uint32_t HoardBridge::GetRetryAfterMs(uint32_t retry_after_ms_field) {
+        return (s_hoardVersion >= 4) ? retry_after_ms_field : 0u;
+    }
 
     // --- Lifecycle ---
 
@@ -143,13 +159,14 @@ namespace FlipOut {
         }
     }
 
-    void HoardBridge::ScheduleRetry(RetryType type, const std::vector<uint32_t>& ids) {
+    void HoardBridge::ScheduleRetry(RetryType type, const std::vector<uint32_t>& ids, int delayMsOverride) {
         int key = static_cast<int>(type);
         int attempts = s_retryAttempts[key];
 
         // Account queries get more retries since user may take time to approve permission
         int maxRetries = (type == RetryType::AccountQuery) ? 10 : RETRY_MAX;
         int delayMs = (type == RetryType::AccountQuery) ? 3000 : RETRY_DELAY_MS;
+        if (delayMsOverride > 0) delayMs = delayMsOverride;
 
         if (attempts >= maxRetries) {
             if (s_API) {
@@ -271,7 +288,7 @@ namespace FlipOut {
 
         // Stack-allocated request (matching Crafty Legend's working pattern)
         HoardQueryItemRequest req{};
-        req.api_version = HOARD_API_VERSION;
+        req.api_version = OutgoingApiVersion();
         strncpy(req.requester, REQUESTER_NAME, sizeof(req.requester));
         req.item_id = item_id;
         strncpy(req.response_event, EV_FO_ITEM_RESPONSE, sizeof(req.response_event));
@@ -300,7 +317,7 @@ namespace FlipOut {
         }
 
         HoardQueryApiRequest req{};
-        req.api_version = HOARD_API_VERSION;
+        req.api_version = OutgoingApiVersion();
         strncpy(req.requester, REQUESTER_NAME, sizeof(req.requester));
         strncpy(req.endpoint, endpoint.c_str(), sizeof(req.endpoint));
         strncpy(req.response_event, EV_FO_API_RESPONSE, sizeof(req.response_event));
@@ -334,7 +351,7 @@ namespace FlipOut {
         int batches = 0;
         for (size_t i = 0; i < to_query.size(); i += BATCH) {
             HoardQueryRecipesRequest req{};
-            req.api_version = HOARD_API_VERSION;
+            req.api_version = OutgoingApiVersion();
             strncpy(req.requester, REQUESTER_NAME, sizeof(req.requester));
             strncpy(req.response_event, EV_FO_RECIPE_RESPONSE, sizeof(req.response_event));
             if (!s_activeAccountName.empty() && s_accountCount > 1) {
@@ -394,7 +411,7 @@ namespace FlipOut {
         if (!s_API) return;
 
         HoardContextMenuRegister reg{};
-        reg.api_version = HOARD_API_VERSION;
+        reg.api_version = OutgoingApiVersion();
         reg.signature = FLIPOUT_SIGNATURE;
         strncpy(reg.id, "add_to_watchlist", sizeof(reg.id));
         strncpy(reg.requester, REQUESTER_NAME, sizeof(reg.requester));
@@ -410,7 +427,7 @@ namespace FlipOut {
         if (!s_API) return;
 
         HoardContextMenuRemove rem{};
-        rem.api_version = HOARD_API_VERSION;
+        rem.api_version = OutgoingApiVersion();
         strncpy(rem.requester, REQUESTER_NAME, sizeof(rem.requester));
         // id left empty = remove all entries from this requester
 
@@ -427,7 +444,7 @@ namespace FlipOut {
         // H&S batches permissions per requester (500ms), so all appear in one popup.
         {
             HoardQueryApiRequest req{};
-            req.api_version = HOARD_API_VERSION;
+            req.api_version = OutgoingApiVersion();
             strncpy(req.requester, REQUESTER_NAME, sizeof(req.requester));
             strncpy(req.endpoint, "/v2/commerce/prices", sizeof(req.endpoint));
             strncpy(req.response_event, EV_FO_PERM_DISCARD, sizeof(req.response_event));
@@ -437,7 +454,7 @@ namespace FlipOut {
         // Fire a dummy item query to trigger EV_HOARD_QUERY_ITEM (account data) permission.
         {
             HoardQueryItemRequest req{};
-            req.api_version = HOARD_API_VERSION;
+            req.api_version = OutgoingApiVersion();
             strncpy(req.requester, REQUESTER_NAME, sizeof(req.requester));
             req.item_id = 19976; // Mystic Coin (common TP item, harmless dummy)
             strncpy(req.response_event, EV_FO_PERM_DISCARD_ITEM, sizeof(req.response_event));
@@ -463,7 +480,7 @@ namespace FlipOut {
         if (!eventArgs) return;
         HoardContextMenuCallback* cb = static_cast<HoardContextMenuCallback*>(eventArgs);
 
-        if (cb->api_version != HOARD_API_VERSION) { delete cb; return; }
+        if (cb->api_version < kMinAcceptedVersion) { delete cb; return; }
 
         uint32_t item_id = cb->item_id;
         std::string name(cb->name);
@@ -520,7 +537,7 @@ namespace FlipOut {
         // Request current buys (stack-allocated)
         {
             HoardQueryApiRequest req{};
-            req.api_version = HOARD_API_VERSION;
+            req.api_version = OutgoingApiVersion();
             strncpy(req.requester, REQUESTER_NAME, sizeof(req.requester));
             strncpy(req.endpoint, "/v2/commerce/transactions/current/buys", sizeof(req.endpoint));
             strncpy(req.response_event, EV_FO_TX_BUYS_RESPONSE, sizeof(req.response_event));
@@ -533,7 +550,7 @@ namespace FlipOut {
         // Request current sells (stack-allocated)
         {
             HoardQueryApiRequest req{};
-            req.api_version = HOARD_API_VERSION;
+            req.api_version = OutgoingApiVersion();
             strncpy(req.requester, REQUESTER_NAME, sizeof(req.requester));
             strncpy(req.endpoint, "/v2/commerce/transactions/current/sells", sizeof(req.endpoint));
             strncpy(req.response_event, EV_FO_TX_SELLS_RESPONSE, sizeof(req.response_event));
@@ -615,8 +632,9 @@ namespace FlipOut {
 
         if (!eventArgs) return; // Backward compat with older H&S
         HoardPongPayload* pong = static_cast<HoardPongPayload*>(eventArgs);
-        if (pong->api_version < 3) return;
+        if (pong->api_version < kMinAcceptedVersion) return;
 
+        s_hoardVersion = pong->api_version;
         s_lastUpdated = pong->last_updated;
         s_refreshAvailableAt = pong->refresh_available_at;
         s_accountCount = pong->account_count;
@@ -674,7 +692,7 @@ namespace FlipOut {
     void HoardBridge::OnFetchProgress(void* eventArgs) {
         if (!eventArgs) return;
         HoardFetchProgressPayload* payload = static_cast<HoardFetchProgressPayload*>(eventArgs);
-        if (payload->api_version != HOARD_API_VERSION) return;
+        if (payload->api_version < kMinAcceptedVersion) return;
         s_fetchProgressMsg = payload->message;
         s_hoardFetching = true;
         // Do NOT delete — payload is stack-allocated by H&S
@@ -683,7 +701,7 @@ namespace FlipOut {
     void HoardBridge::OnFetchError(void* eventArgs) {
         if (!eventArgs) return;
         HoardFetchErrorPayload* payload = static_cast<HoardFetchErrorPayload*>(eventArgs);
-        if (payload->api_version != HOARD_API_VERSION) return;
+        if (payload->api_version < kMinAcceptedVersion) return;
         s_hoardFetching = false;
 
         if (s_API) {
@@ -699,7 +717,7 @@ namespace FlipOut {
         if (!eventArgs) return;
         HoardQueryItemResponse* resp = static_cast<HoardQueryItemResponse*>(eventArgs);
 
-        if (resp->api_version != HOARD_API_VERSION) { delete resp; return; }
+        if (resp->api_version < kMinAcceptedVersion) { delete resp; return; }
 
         if (resp->status == HOARD_STATUS_PENDING) {
             s_permissionPending = true;
@@ -746,7 +764,7 @@ namespace FlipOut {
         if (!eventArgs) return;
         HoardQueryApiResponse* resp = static_cast<HoardQueryApiResponse*>(eventArgs);
 
-        if (resp->api_version != HOARD_API_VERSION) { delete resp; return; }
+        if (resp->api_version < kMinAcceptedVersion) { delete resp; return; }
 
         if (resp->status == HOARD_STATUS_PENDING) {
             s_permissionPending = true;
@@ -759,6 +777,24 @@ namespace FlipOut {
         }
         if (resp->status == HOARD_STATUS_DENIED) {
             s_permissionDenied = true;
+            delete resp;
+            return;
+        }
+        if (resp->status == HOARD_STATUS_BUSY) {
+            // Generic API queries are not retryable (callback is one-shot).
+            // Drop the pending callback so it doesn't dangle and log.
+            std::function<void(const std::string&)> cb;
+            {
+                std::lock_guard<std::mutex> lock(s_mutex);
+                cb = s_apiCallback;
+                s_apiCallback = nullptr;
+            }
+            if (cb) cb(std::string());  // signal failure with empty payload
+            if (s_API) {
+                uint32_t wait = GetRetryAfterMs(resp->retry_after_ms);
+                std::string msg = "H&S API query throttled (BUSY), retry in " + std::to_string(wait) + "ms";
+                s_API->Log(LOGL_WARNING, "FlipOut", msg.c_str());
+            }
             delete resp;
             return;
         }
@@ -782,7 +818,7 @@ namespace FlipOut {
         if (!eventArgs) return;
         HoardQueryApiResponse* resp = static_cast<HoardQueryApiResponse*>(eventArgs);
 
-        if (resp->api_version != HOARD_API_VERSION) { delete resp; return; }
+        if (resp->api_version < kMinAcceptedVersion) { delete resp; return; }
 
         if (resp->status != HOARD_STATUS_OK) {
             if (resp->status == HOARD_STATUS_PENDING) {
@@ -796,6 +832,17 @@ namespace FlipOut {
                 s_permissionDenied = true;
                 std::lock_guard<std::mutex> lock(s_mutex);
                 s_txLoading = false;
+            } else if (resp->status == HOARD_STATUS_BUSY) {
+                {
+                    std::lock_guard<std::mutex> lock(s_mutex);
+                    s_txLoading = false;
+                }
+                int wait = (int)GetRetryAfterMs(resp->retry_after_ms);
+                if (s_API) {
+                    std::string msg = "H&S throttled buys query (BUSY), retry in " + std::to_string(wait) + "ms";
+                    s_API->Log(LOGL_WARNING, "FlipOut", msg.c_str());
+                }
+                ScheduleRetry(RetryType::TransactionBuys, {}, wait);
             }
             delete resp;
             return;
@@ -829,7 +876,7 @@ namespace FlipOut {
         if (!eventArgs) return;
         HoardQueryApiResponse* resp = static_cast<HoardQueryApiResponse*>(eventArgs);
 
-        if (resp->api_version != HOARD_API_VERSION) { delete resp; return; }
+        if (resp->api_version < kMinAcceptedVersion) { delete resp; return; }
 
         if (resp->status != HOARD_STATUS_OK) {
             if (resp->status == HOARD_STATUS_PENDING) {
@@ -843,6 +890,17 @@ namespace FlipOut {
                 s_permissionDenied = true;
                 std::lock_guard<std::mutex> lock(s_mutex);
                 s_txLoading = false;
+            } else if (resp->status == HOARD_STATUS_BUSY) {
+                {
+                    std::lock_guard<std::mutex> lock(s_mutex);
+                    s_txLoading = false;
+                }
+                int wait = (int)GetRetryAfterMs(resp->retry_after_ms);
+                if (s_API) {
+                    std::string msg = "H&S throttled sells query (BUSY), retry in " + std::to_string(wait) + "ms";
+                    s_API->Log(LOGL_WARNING, "FlipOut", msg.c_str());
+                }
+                ScheduleRetry(RetryType::TransactionSells, {}, wait);
             }
             delete resp;
             return;
@@ -876,7 +934,7 @@ namespace FlipOut {
         if (!eventArgs) return;
         HoardQueryRecipesResponse* resp = static_cast<HoardQueryRecipesResponse*>(eventArgs);
 
-        if (resp->api_version != HOARD_API_VERSION) { delete resp; return; }
+        if (resp->api_version < kMinAcceptedVersion) { delete resp; return; }
 
         if (resp->status == HOARD_STATUS_PENDING) {
             s_permissionPending = true;
@@ -889,6 +947,28 @@ namespace FlipOut {
                 s_recipeBatchesPending = 0;
             }
             ScheduleRetry(RetryType::RecipeUnlock, retryIds);
+            delete resp;
+            return;
+        }
+        if (resp->status == HOARD_STATUS_BUSY) {
+            // Throttled. The response doesn't echo back which IDs were in this
+            // batch, so re-queue everything queried-but-not-yet-confirmed and
+            // back off with H&S's hint.
+            std::vector<uint32_t> retryIds;
+            {
+                std::lock_guard<std::mutex> lock(s_mutex);
+                for (uint32_t id : s_queriedRecipes) {
+                    if (!s_unlockedRecipes.count(id)) retryIds.push_back(id);
+                }
+                s_queriedRecipes.clear();
+                s_recipeBatchesPending = 0;
+            }
+            int wait = (int)GetRetryAfterMs(resp->retry_after_ms);
+            if (s_API) {
+                std::string msg = "H&S throttled recipe query (BUSY), retry in " + std::to_string(wait) + "ms";
+                s_API->Log(LOGL_WARNING, "FlipOut", msg.c_str());
+            }
+            if (!retryIds.empty()) ScheduleRetry(RetryType::RecipeUnlock, retryIds, wait);
             delete resp;
             return;
         }
@@ -933,7 +1013,7 @@ namespace FlipOut {
         if (!s_API) return;
 
         HoardQueryAccountsRequest req{};
-        req.api_version = HOARD_API_VERSION;
+        req.api_version = OutgoingApiVersion();
         strncpy(req.requester, REQUESTER_NAME, sizeof(req.requester));
         strncpy(req.response_event, EV_FO_ACCOUNTS_RESPONSE, sizeof(req.response_event));
 
@@ -1040,7 +1120,7 @@ namespace FlipOut {
         if (!eventArgs) return;
         HoardQueryAccountsResponse* resp = static_cast<HoardQueryAccountsResponse*>(eventArgs);
 
-        if (resp->api_version != HOARD_API_VERSION) { delete resp; return; }
+        if (resp->api_version < kMinAcceptedVersion) { delete resp; return; }
 
         if (resp->status == HOARD_STATUS_PENDING) {
             s_permissionPending = true;

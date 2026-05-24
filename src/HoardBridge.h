@@ -166,6 +166,11 @@ namespace FlipOut {
         // Resolve character name to account
         static void ResolveCurrentAccount();
 
+        // API version helpers
+        static uint32_t OutgoingApiVersion();
+        static uint32_t GetRetryAfterMs(uint32_t retry_after_ms_field);
+        static constexpr uint32_t kMinAcceptedVersion = 3u;
+
         static AddonAPI_t* s_API;
 
         // H&S connection state
@@ -175,6 +180,7 @@ namespace FlipOut {
         static int64_t s_lastUpdated;
         static int64_t s_refreshAvailableAt;
         static uint32_t s_accountCount;
+        static uint32_t s_hoardVersion;  // H&S API version, learned from pong (0 = unknown)
 
         // Multi-account state
         static std::vector<AccountInfo> s_accounts;
@@ -200,7 +206,7 @@ namespace FlipOut {
         static std::unordered_map<int, int> s_retryAttempts; // RetryType(int) -> attempt count
         static const int RETRY_MAX = 3;
         static const int RETRY_DELAY_MS = 2000;
-        static void ScheduleRetry(RetryType type, const std::vector<uint32_t>& ids);
+        static void ScheduleRetry(RetryType type, const std::vector<uint32_t>& ids, int delayMsOverride = 0);
         static void ProcessRetries();
         static void ResetRetryCount(RetryType type);
 
