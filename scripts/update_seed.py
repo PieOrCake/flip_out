@@ -8,8 +8,13 @@ Usage:
 The seed format matches Flip Out's PriceDB ExportSeed/ImportSeed:
     { "item_id": [ {"t": unix, "b": buy, "s": sell, "bq": buy_qty, "sq": sell_qty}, ... ], ... }
 
-Trimming: keeps only entries from the last 30 days (oldest-first). If an entry's
-timestamp is older than 30 days before the current fetch time, it is discarded.
+Trimming: keeps only entries from the last 14 days (oldest-first). If an entry's
+timestamp is older than 14 days before the current fetch time, it is discarded.
+
+Downsampling: at most one entry per item per UTC day is kept — the most recent
+one for that day. The workflow runs every 6 hours, so without this the seed would
+hold ~4 entries per item per day, which is far more granularity than new installs
+need and inflates the download substantially.
 """
 
 import argparse
@@ -21,7 +26,7 @@ import urllib.error
 
 GW2_PRICES_URL = "https://api.guildwars2.com/v2/commerce/prices"
 BATCH_SIZE = 200
-MAX_AGE_DAYS = 30
+MAX_AGE_DAYS = 14
 
 
 def fetch_all_item_ids():
@@ -71,12 +76,26 @@ def fetch_all_prices(item_ids):
     return snapshots
 
 
+def downsample_daily(entries):
+    """
+    Keep at most one entry per UTC day — the most recent one for that day.
+
+    `entries` must already be sorted oldest-first. Because later entries win,
+    the current day's entry is refreshed on every run until the day rolls over.
+    """
+    by_day = {}
+    for e in entries:
+        by_day[e["t"] // 86400] = e
+    return [by_day[day] for day in sorted(by_day)]
+
+
 def merge_seed(existing, new_snapshots, cutoff_ts):
     """
     Merge new snapshots into the existing seed data.
 
     - Appends the new snapshot for each item.
     - Removes any entries with timestamp older than cutoff_ts.
+    - Downsamples to at most one entry per item per UTC day.
     - Entries are kept in chronological order (oldest first).
     """
     merged = {}
@@ -91,11 +110,12 @@ def merge_seed(existing, new_snapshots, cutoff_ts):
         if item_id in new_snapshots:
             entries.append(new_snapshots[item_id])
 
-        # Remove entries older than cutoff (30 days)
+        # Remove entries older than cutoff
         entries = [e for e in entries if e["t"] >= cutoff_ts]
 
-        # Sort chronologically (oldest first)
+        # Sort chronologically (oldest first), then thin to one per day
         entries.sort(key=lambda e: e["t"])
+        entries = downsample_daily(entries)
 
         if entries:
             merged[item_id] = entries
@@ -127,7 +147,7 @@ def main():
     new_snapshots = fetch_all_prices(item_ids)
     print(f"Fetched prices for {len(new_snapshots)} items", file=sys.stderr)
 
-    # Merge and trim to 30 days
+    # Merge, trim to MAX_AGE_DAYS, and thin to one entry per day
     now = int(time.time())
     cutoff = now - (MAX_AGE_DAYS * 86400)
     merged = merge_seed(existing, new_snapshots, cutoff)

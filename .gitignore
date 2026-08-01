@@ -12,3 +12,7 @@ Makefile
 push_seed.sh
 CLAUDE.md
 handover.md
+
+# Python
+__pycache__/
+*.pyc

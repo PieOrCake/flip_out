@@ -373,14 +373,27 @@ static void TryDownloadSeed() {
     std::thread([]() {
         try {
             std::string data = FlipOut::HttpClient::Get(SEED_URL);
-            if (data.empty() || data[0] != '{') return;
+            if (data.empty()) {
+                if (APIDefs) APIDefs->Log(LOGL_WARNING, "FlipOut",
+                    "Seed price download failed (no response) - Market Movers will build history locally");
+                return;
+            }
+            if (data[0] != '{') {
+                if (APIDefs) APIDefs->Log(LOGL_WARNING, "FlipOut",
+                    "Seed price download returned unexpected content - skipping import");
+                return;
+            }
             if (FlipOut::PriceDB::ImportSeed(data)) {
                 FlipOut::PriceDB::Save();
                 if (APIDefs) {
                     APIDefs->Log(LOGL_INFO, "FlipOut", "Imported community seed price data");
                 }
+            } else if (APIDefs) {
+                APIDefs->Log(LOGL_WARNING, "FlipOut", "Seed price data could not be parsed");
             }
-        } catch (...) {}
+        } catch (...) {
+            if (APIDefs) APIDefs->Log(LOGL_WARNING, "FlipOut", "Seed price import threw an exception");
+        }
     }).detach();
 }
 
