@@ -12,9 +12,10 @@ Trimming: keeps only entries from the last 14 days (oldest-first). If an entry's
 timestamp is older than 14 days before the current fetch time, it is discarded.
 
 Downsampling: at most one entry per item per UTC day is kept — the most recent
-one for that day. The workflow runs every 6 hours, so without this the seed would
-hold ~4 entries per item per day, which is far more granularity than new installs
-need and inflates the download substantially.
+one for that day. The workflow now runs daily, so this is mostly a no-op going
+forward, but it keeps the guarantee if the schedule is ever made more frequent
+again, and it collapses any historical backlog that was captured at a higher
+rate on the next run.
 """
 
 import argparse
